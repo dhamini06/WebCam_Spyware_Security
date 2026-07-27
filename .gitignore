@@ -1,0 +1,16 @@
+.venv/
+__pycache__/
+*.pyc
+build/
+dist/
+*.spec
+*.db
+database/*.db
+logs/*.log
+reports/*.json
+reports/*.csv
+reports/*.pdf
+temp/
+intruder_images/
+assets/faces/
+*.exe
