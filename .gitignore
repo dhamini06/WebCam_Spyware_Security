@@ -14,3 +14,5 @@ temp/
 intruder_images/
 assets/faces/
 *.exe
+
+database/.encryption_key

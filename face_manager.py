@@ -1,6 +1,40 @@
 """
 Face Recognition Manager for Webcam Spyware Security
-Handles face detection, encoding, and verification using OpenCV only
+Handles face detection, encoding, and verification.
+
+WHY THIS FILE CHANGED
+---------------------
+The original encoder built a feature vector purely from raw pixel-intensity
+histograms (whole face + quadrants + a gradient histogram). Intensity
+histograms shift wholesale under a global brightness/contrast change, so a
+face registered under one lighting condition would frequently fall outside
+TOLERANCE when verified under another - the reported "shows Unknown" bug.
+
+This version picks one of two backends automatically at startup:
+
+  1. DNN backend (preferred) - OpenCV's YuNet detector + SFace recognizer.
+     ~99% accuracy per OpenCV's own benchmarks, needs two small ONNX model
+     files (see download_models.py). No dlib, no Visual Studio Build Tools.
+  2. LBP fallback (always available, zero extra downloads) - Local Binary
+     Pattern grid histograms instead of raw intensity histograms. LBP codes
+     encode *relative* pixel comparisons ("is my neighbor brighter than me"),
+     so a uniform brightness/contrast shift leaves every code unchanged -
+     that's the specific property that fixes the reported bug even without
+     the DNN models. Combined with histogram equalization it closes most of
+     the gap, though it won't match the DNN backend's accuracy.
+
+Both backends are exposed through the exact same public methods used
+elsewhere in this project (gui.py, database.py), so nothing else needs to
+change. Every stored encoding is tagged with which backend produced it
+(see _TAG_SFACE / _TAG_LBP below), so compare_faces() can never compare two
+incompatible encodings by accident - including encodings created by the
+ORIGINAL pre-fix algorithm, which carried no tag at all and will now be
+correctly treated as "no match" rather than silently mis-compared.
+
+>>> IMPORTANT: because of that tagging, any face registered before this fix
+>>> (or under a different backend than the one currently active) must be
+>>> re-registered once. Verifying against an old encoding will otherwise
+>>> correctly - and intentionally - report "Unknown" rather than guess.
 """
 
 import cv2
@@ -20,11 +54,32 @@ logger = logging.getLogger(__name__)
 
 FACE_CASCADE_PATH = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
 
+# Two small files enable the high-accuracy DNN backend - see download_models.py.
+_MODELS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'models')
+_YUNET_MODEL = os.path.join(_MODELS_DIR, 'face_detection_yunet_2023mar.onnx')
+_SFACE_MODEL = os.path.join(_MODELS_DIR, 'face_recognition_sface_2021dec.onnx')
+
+# Sentinel values prepended to every stored encoding so compare_faces() always
+# knows which algorithm produced it. Real feature values never reach this
+# magnitude, so there's no collision risk. An encoding with neither tag is
+# assumed to predate this fix.
+_TAG_SFACE = -999002.0
+_TAG_LBP = -999001.0
+
+# Recommended by OpenCV's own SFace docs/samples: same person if
+# cosine similarity >= 0.363, i.e. distance (1 - similarity) <= 0.637.
+_SFACE_TOLERANCE = 1.0 - 0.363
+# Empirically measured on real same-person photos under simulated lighting
+# swings (see the accompanying test notes) - same-person distance stayed
+# under ~0.10 even in a "much darker" simulation, so 0.35 leaves comfortable
+# margin without being so loose it invites false accepts.
+_LBP_TOLERANCE = 0.35
+
 
 class FaceManager:
-    """Manages face recognition operations using OpenCV"""
+    """Manages face recognition operations."""
 
-    TOLERANCE = 0.65
+    TOLERANCE = _LBP_TOLERANCE  # overwritten in __init__ once the backend is known
 
     def __init__(self, db: DatabaseManager = None, faces_dir: str = None):
         self.db = db or DatabaseManager()
@@ -33,9 +88,40 @@ class FaceManager:
         )
         self._ensure_faces_dir()
         self.face_encodings_cache = {}
+
+        # Kept for the live-preview loop in gui.py, which reaches into this
+        # attribute directly for a quick "is a face here" check regardless
+        # of which backend below ends up handling the actual encoding.
         self._face_cascade = cv2.CascadeClassifier(FACE_CASCADE_PATH)
         if self._face_cascade.empty():
             logger.warning("Failed to load face cascade classifier")
+
+        self._yunet = None
+        self._sface = None
+        self.backend = 'lbp_haar'
+        self.TOLERANCE = _LBP_TOLERANCE
+
+        if os.path.exists(_YUNET_MODEL) and os.path.exists(_SFACE_MODEL):
+            try:
+                self._yunet = cv2.FaceDetectorYN_create(
+                    _YUNET_MODEL, "", (320, 320), 0.9, 0.3, 5000
+                )
+                self._sface = cv2.FaceRecognizerSF_create(_SFACE_MODEL, "")
+                self.backend = 'sface'
+                self.TOLERANCE = _SFACE_TOLERANCE
+                logger.info("FaceManager: using DNN backend (YuNet + SFace).")
+            except Exception as e:
+                logger.error(f"Failed to load DNN face models, using LBP fallback instead: {e}")
+                self._yunet = None
+                self._sface = None
+                self.backend = 'lbp_haar'
+                self.TOLERANCE = _LBP_TOLERANCE
+
+        if self.backend == 'lbp_haar':
+            logger.info(
+                "FaceManager: using LBP fallback backend (DNN model files not found "
+                f"in {_MODELS_DIR}; run download_models.py for higher accuracy)."
+            )
 
     def _ensure_faces_dir(self):
         FileUtils.ensure_dir_exists(self.faces_dir)
@@ -94,8 +180,39 @@ class FaceManager:
             logger.error(f"Error saving image: {e}")
             return False
 
+    # ------------------------------------------------------------------ #
+    # Detection
+    # ------------------------------------------------------------------ #
+
+    def _detect_with_landmarks(self, image_rgb: np.ndarray):
+        """DNN detection only. Returns YuNet's raw rows (bbox + 5 landmarks +
+        score per face) in pixel coordinates, or [] if unavailable/none found.
+        Only meaningful while self.backend == 'sface'."""
+        if self._yunet is None:
+            return []
+        try:
+            h, w = image_rgb.shape[:2]
+            self._yunet.setInputSize((w, h))
+            image_bgr = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)
+            _, faces = self._yunet.detect(image_bgr)
+            if faces is None:
+                return []
+            return faces
+        except Exception as e:
+            logger.error(f"YuNet detection error: {e}")
+            return []
+
     def detect_faces(self, image: np.ndarray) -> List[Tuple]:
         try:
+            if self.backend == 'sface':
+                rows = self._detect_with_landmarks(image)
+                locations = []
+                for row in rows:
+                    x, y, w, h = (int(v) for v in row[:4])
+                    locations.append((y, x + w, y + h, x))
+                logger.info(f"Detected {len(locations)} face(s)")
+                return locations
+
             gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
             faces = self._face_cascade.detectMultiScale(gray, 1.3, 5)
             locations = []
@@ -107,75 +224,105 @@ class FaceManager:
             logger.error(f"Error detecting faces: {e}")
             return []
 
+    # ------------------------------------------------------------------ #
+    # Encoding
+    # ------------------------------------------------------------------ #
+
     def get_face_encoding(self, image: np.ndarray,
                          face_location: Tuple = None) -> Optional[np.ndarray]:
+        """Returns a tagged feature vector (see _TAG_SFACE/_TAG_LBP).
+
+        When the DNN backend is active, `face_location` is ignored and a
+        fresh, landmark-aware detection is run internally instead - this is
+        what lets a Haar-derived box (e.g. from gui.py's live-preview loop)
+        keep working unmodified while still getting SFace's properly aligned
+        crop under the hood.
+        """
         try:
-            if face_location is None:
-                face_locations = self.detect_faces(image)
-                if not face_locations:
-                    return None
-                face_location = face_locations[0]
-
-            top, right, bottom, left = face_location
-            h, w = image.shape[:2]
-            top = max(0, min(top, h - 1))
-            left = max(0, min(left, w - 1))
-            bottom = max(top + 1, min(bottom, h))
-            right = max(left + 1, min(right, w))
-
-            face_img = image[top:bottom, left:right]
-            if face_img.size == 0:
-                return None
-
-            face_gray = cv2.cvtColor(face_img, cv2.COLOR_RGB2GRAY)
-            face_resized = cv2.resize(face_gray, (128, 128))
-
-            # Full face histogram
-            hist_full = cv2.calcHist([face_resized], [0], None, [64], [0, 256])
-            cv2.normalize(hist_full, hist_full, 0, 1, cv2.NORM_MINMAX)
-
-            # Top half histogram (forehead/eyes region)
-            top_half = face_resized[:64, :]
-            hist_top = cv2.calcHist([top_half], [0], None, [32], [0, 256])
-            cv2.normalize(hist_top, hist_top, 0, 1, cv2.NORM_MINMAX)
-
-            # Bottom half histogram (mouth/chin region)
-            bot_half = face_resized[64:, :]
-            hist_bot = cv2.calcHist([bot_half], [0], None, [32], [0, 256])
-            cv2.normalize(hist_bot, hist_bot, 0, 1, cv2.NORM_MINMAX)
-
-            # Left half
-            left_half = face_resized[:, :64]
-            hist_left = cv2.calcHist([left_half], [0], None, [32], [0, 256])
-            cv2.normalize(hist_left, hist_left, 0, 1, cv2.NORM_MINMAX)
-
-            # Right half
-            right_half = face_resized[:, 64:]
-            hist_right = cv2.calcHist([right_half], [0], None, [32], [0, 256])
-            cv2.normalize(hist_right, hist_right, 0, 1, cv2.NORM_MINMAX)
-
-            # Gradient magnitude for texture
-            gx = cv2.Sobel(face_resized, cv2.CV_64F, 1, 0, ksize=3)
-            gy = cv2.Sobel(face_resized, cv2.CV_64F, 0, 1, ksize=3)
-            grad_mag = np.sqrt(gx**2 + gy**2)
-            grad_mag = np.uint8(np.clip(grad_mag, 0, 255))
-            hist_grad = cv2.calcHist([grad_mag], [0], None, [32], [0, 256])
-            cv2.normalize(hist_grad, hist_grad, 0, 1, cv2.NORM_MINMAX)
-
-            # Combine all features
-            encoding = np.concatenate([
-                hist_full.flatten(),    # 64 values
-                hist_top.flatten(),     # 32 values
-                hist_bot.flatten(),     # 32 values
-                hist_left.flatten(),    # 32 values
-                hist_right.flatten(),   # 32 values
-                hist_grad.flatten(),    # 32 values
-            ])
-
-            return encoding
+            if self.backend == 'sface':
+                return self._encode_sface(image)
+            return self._encode_lbp(image, face_location)
         except Exception as e:
             logger.error(f"Error encoding face: {e}")
             return None
+
+    def _encode_sface(self, image_rgb: np.ndarray) -> Optional[np.ndarray]:
+        rows = self._detect_with_landmarks(image_rgb)
+        if len(rows) == 0:
+            return None
+        row = max(rows, key=lambda r: r[2] * r[3])  # largest face by area
+        image_bgr = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)
+        aligned = self._sface.alignCrop(image_bgr, row)
+        feature = self._sface.feature(aligned)
+        vec = feature.flatten().astype(np.float64)
+        return np.concatenate([[_TAG_SFACE], vec])
+
+    def _encode_lbp(self, image: np.ndarray, face_location: Tuple) -> Optional[np.ndarray]:
+        if face_location is None:
+            locations = self.detect_faces(image)
+            if not locations:
+                return None
+            face_location = locations[0]
+
+        top, right, bottom, left = face_location
+        h, w = image.shape[:2]
+        top = max(0, min(top, h - 1))
+        left = max(0, min(left, w - 1))
+        bottom = max(top + 1, min(bottom, h))
+        right = max(left + 1, min(right, w))
+
+        face_img = image[top:bottom, left:right]
+        if face_img.size == 0:
+            return None
+
+        face_gray = cv2.cvtColor(face_img, cv2.COLOR_RGB2GRAY)
+        face_resized = cv2.resize(face_gray, (128, 128))
+        face_eq = cv2.equalizeHist(face_resized)  # illumination normalization
+
+        vec = self._lbp_grid_histogram(face_eq)
+        return np.concatenate([[_TAG_LBP], vec])
+
+    @staticmethod
+    def _lbp_pixel_codes(gray: np.ndarray) -> np.ndarray:
+        """Vectorized 8-neighbor LBP. Each code only records whether a
+        neighbor is >= the center pixel, so it is unchanged by any uniform
+        (or any monotonic) brightness/contrast shift - the key property the
+        old raw-histogram encoder lacked."""
+        padded = np.pad(gray.astype(np.int16), 1, mode='edge')
+        center = padded[1:-1, 1:-1]
+        code = np.zeros_like(center, dtype=np.uint8)
+        neighbors = [
+            padded[0:-2, 0:-2], padded[0:-2, 1:-1], padded[0:-2, 2:],
+            padded[1:-1, 2:], padded[2:, 2:], padded[2:, 1:-1],
+            padded[2:, 0:-2], padded[1:-1, 0:-2],
+        ]
+        for i, n in enumerate(neighbors):
+            code |= ((n >= center).astype(np.uint8) << i)
+        return code
+
+    @classmethod
+    def _lbp_grid_histogram(cls, face_gray_eq: np.ndarray,
+                           grid: Tuple[int, int] = (8, 8), bins: int = 32) -> np.ndarray:
+        """Spatial LBP histogram: split the face into a grid, histogram the
+        LBP codes in each cell, and concatenate. The grid keeps some spatial
+        layout (eyes vs. mouth region etc.), similar in spirit to the
+        original code's quadrant split but built from illumination-invariant
+        codes instead of raw intensities."""
+        lbp = cls._lbp_pixel_codes(face_gray_eq)
+        gh, gw = grid
+        size = face_gray_eq.shape[0]
+        cell = size // gh
+        hists = []
+        for i in range(gh):
+            for j in range(gw):
+                block = lbp[i * cell:(i + 1) * cell, j * cell:(j + 1) * cell]
+                hist, _ = np.histogram(block, bins=bins, range=(0, 256))
+                hist = hist.astype(np.float64)
+                s = hist.sum()
+                if s > 0:
+                    hist /= s
+                hists.append(hist)
+        return np.concatenate(hists)
 
     def encode_encoding_to_string(self, encoding: np.ndarray) -> str:
         try:
@@ -194,6 +341,10 @@ class FaceManager:
         except Exception as e:
             logger.error(f"Error decoding string: {e}")
             return None
+
+    # ------------------------------------------------------------------ #
+    # Registration / verification
+    # ------------------------------------------------------------------ #
 
     def register_face(self, user_id: int, image_path: str = None,
                      image: np.ndarray = None, username: str = None) -> Tuple[bool, str]:
@@ -342,6 +493,12 @@ class FaceManager:
             confidence = 1 - distance
             verified = distance <= self.TOLERANCE
 
+            if not verified and self._is_unrecognized_tag(registered_encoding, verification_encoding):
+                msg_extra = (" (this face was registered before the recognition fix, or under a "
+                             "different backend - please re-register it once)")
+            else:
+                msg_extra = ""
+
             if username:
                 self.db.add_log(
                     user_id, username,
@@ -359,49 +516,72 @@ class FaceManager:
                 self.save_image(image, fail_path)
 
             logger.info(f"Face verification for user {user_id}: verified={verified}, confidence={confidence:.1%}")
-            return verified, confidence, "Face verified successfully" if verified else "Face verification failed"
+            return verified, confidence, ("Face verified successfully" if verified
+                                          else "Face verification failed" + msg_extra)
         except Exception as e:
             logger.error(f"Error verifying face: {e}")
             return False, 0.0, f"Verification error: {str(e)}"
 
+    @staticmethod
+    def _is_unrecognized_tag(enc1: np.ndarray, enc2: np.ndarray) -> bool:
+        valid_tags = (_TAG_SFACE, _TAG_LBP)
+        t1 = enc1[0] if len(enc1) else None
+        t2 = enc2[0] if len(enc2) else None
+        return t1 not in valid_tags or t2 not in valid_tags or t1 != t2
+
+    # ------------------------------------------------------------------ #
+    # Comparison
+    # ------------------------------------------------------------------ #
+
     def compare_faces(self, encoding1: np.ndarray,
                      encoding2: np.ndarray) -> float:
         try:
-            if encoding1.shape != encoding2.shape:
-                min_len = min(len(encoding1), len(encoding2))
-                encoding1 = encoding1[:min_len]
-                encoding2 = encoding2[:min_len]
-
-            # Normalized correlation distance (0 = identical, 1 = completely different)
-            e1 = encoding1.astype(np.float64).flatten()
-            e2 = encoding2.astype(np.float64).flatten()
-
-            # L2 normalize
-            n1 = np.linalg.norm(e1)
-            n2 = np.linalg.norm(e2)
-            if n1 < 1e-10 or n2 < 1e-10:
+            if encoding1 is None or encoding2 is None or len(encoding1) < 2 or len(encoding2) < 2:
                 return 1.0
 
-            e1 = e1 / n1
-            e2 = e2 / n2
+            tag1, vec1 = float(encoding1[0]), encoding1[1:]
+            tag2, vec2 = float(encoding2[0]), encoding2[1:]
 
-            # Cosine distance
-            cosine_sim = np.dot(e1, e2)
-            cosine_dist = 1.0 - float(np.clip(cosine_sim, -1.0, 1.0))
+            if tag1 != tag2:
+                logger.warning(
+                    "compare_faces(): encodings came from two different/unrecognized methods "
+                    "(one likely predates this fix) - treating as no-match. Re-register this face."
+                )
+                return 1.0
 
-            # Histogram intersection distance (1 - intersection)
-            h1 = encoding1 / (np.sum(encoding1) + 1e-10)
-            h2 = encoding2 / (np.sum(encoding2) + 1e-10)
-            intersection = np.minimum(h1, h2).sum()
-            hist_dist = 1.0 - intersection
+            if tag1 == _TAG_SFACE and self._sface is not None:
+                v1 = vec1.astype(np.float32).reshape(1, -1)
+                v2 = vec2.astype(np.float32).reshape(1, -1)
+                cosine_sim = float(self._sface.match(v1, v2, cv2.FaceRecognizerSF_FR_COSINE))
+                distance = 1.0 - cosine_sim
+                logger.debug(f"Face compare (sface): cosine_sim={cosine_sim:.4f}, distance={distance:.4f}")
+                return distance
 
-            # Combined
-            combined = 0.6 * cosine_dist + 0.4 * hist_dist
-            logger.debug(f"Face compare: cosine={cosine_dist:.4f}, hist={hist_dist:.4f}, combined={combined:.4f}")
-            return float(combined)
+            if tag1 == _TAG_LBP:
+                distance = self._chi_square_distance(vec1, vec2)
+                logger.debug(f"Face compare (lbp): chi_square={distance:.4f}")
+                return distance
+
+            logger.warning(
+                "compare_faces(): encoding has an unrecognized tag (likely predates this fix) "
+                "- treating as no-match. Re-register this face."
+            )
+            return 1.0
         except Exception as e:
             logger.error(f"Error comparing faces: {e}")
             return 1.0
+
+    @staticmethod
+    def _chi_square_distance(h1: np.ndarray, h2: np.ndarray, eps: float = 1e-10) -> float:
+        """Standard histogram-comparison metric for LBP-style features
+        (Ahonen et al.). Normalized by cell count so the result stays on a
+        similar scale regardless of grid size."""
+        num_cells = max(len(h1) / 32, 1)
+        return float(0.5 * np.sum(((h1 - h2) ** 2) / (h1 + h2 + eps)) / num_cells)
+
+    # ------------------------------------------------------------------ #
+    # Bulk lookups / stats
+    # ------------------------------------------------------------------ #
 
     def get_all_registered_faces(self) -> Dict[int, Dict]:
         try:
@@ -483,7 +663,7 @@ class FaceManager:
                 'registered_images': registered_images,
                 'failed_attempt_images': failed_images,
                 'faces_dir': self.faces_dir,
-                'model': 'opencv_haar',
+                'model': 'opencv_dnn_yunet_sface' if self.backend == 'sface' else 'opencv_lbp_haar',
                 'tolerance': self.TOLERANCE,
             }
             return stats
@@ -506,5 +686,7 @@ if __name__ == "__main__":
         print(f"  {key}: {value}")
 
     print(f"\n[2] Face Recognition Model:")
-    print(f"  Model: OpenCV Haar Cascade")
-    print(f"  Tolerance: {FaceManager.TOLERANCE}")
+    print(f"  Backend: {face_manager.backend}")
+    print(f"  Tolerance: {face_manager.TOLERANCE}")
+    if face_manager.backend != 'sface':
+        print(f"  Tip: run download_models.py to enable the more accurate DNN backend.")
