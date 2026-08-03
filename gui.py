@@ -6,6 +6,7 @@ Built with CustomTkinter - Modern Dark Theme GUI
 import customtkinter as ctk
 from tkinter import messagebox
 import threading
+import sys
 from typing import Optional, Callable, Dict, Any, List
 import logging
 import os
@@ -20,6 +21,7 @@ from face_manager import FaceManager
 from logging_manager import LoggingManager
 from report_generator import ReportGenerator
 from utils import SystemInfo, DateTimeUtils
+from project_info import open_project_info
 
 logger = logging.getLogger(__name__)
 
@@ -135,12 +137,108 @@ class LoginScreen(ctk.CTkFrame):
         try:
             success, msg, token = self.auth.login(username, password)
             if success:
-                self.on_login(self.auth.current_user, token)
+                # Password was correct; a one-time code was emailed.
+                # token is intentionally None until the code is verified.
+                self.status_label.configure(text=msg, text_color=AppConfig.COLOR_SUCCESS)
+                OtpDialog(self, self.auth, username, password, self.on_login, delivery_message=msg)
             else:
                 self.status_label.configure(text=msg, text_color=AppConfig.COLOR_DANGER)
         except Exception as e:
             logger.error(f"Login error: {e}", exc_info=True)
             self.status_label.configure(text=f"Login failed: {e}", text_color=AppConfig.COLOR_DANGER)
+
+
+class OtpDialog(ctk.CTkToplevel):
+    """Shown after a correct username+password, before granting access -
+    asks for the one-time code that was emailed to the user."""
+
+    def __init__(self, parent, auth: AuthenticationManager, username: str, password: str,
+                 on_login: Callable, delivery_message: str = None):
+        super().__init__(parent)
+        self.auth = auth
+        self.username = username
+        self._password = password  # held in memory only, for "Resend code"; never written to disk or logged
+        self.on_login = on_login
+        self._delivery_message = delivery_message
+        self.title("Verification Code")
+        self.geometry("380x300")
+        self.configure(fg_color=AppConfig.COLOR_DARK_BG)
+        self.transient(parent)
+        self.grab_set()
+        self.protocol("WM_DELETE_WINDOW", self._on_cancel)
+
+        self._center_window()
+        self._build_ui()
+
+    def _center_window(self):
+        self.update_idletasks()
+        w, h = self.winfo_width(), self.winfo_height()
+        x = (self.winfo_screenwidth() // 2) - (w // 2)
+        y = (self.winfo_screenheight() // 2) - (h // 2)
+        self.geometry(f"{w}x{h}+{x}+{y}")
+
+    def _build_ui(self):
+        card = ctk.CTkFrame(self, fg_color="#2a2a2a", corner_radius=10)
+        card.pack(padx=20, pady=20, fill="both", expand=True)
+
+        ctk.CTkLabel(card, text="Enter Verification Code", font=AppConfig.FONT_NORMAL,
+                     text_color=AppConfig.COLOR_TEXT).pack(anchor="w", padx=20, pady=(20, 5))
+        delivery_text = self._delivery_message or "We emailed a 6-digit code to your registered address."
+        ctk.CTkLabel(card, text=delivery_text,
+                     font=AppConfig.FONT_SMALL, text_color="#888888", wraplength=280,
+                     justify="left").pack(anchor="w", padx=20, pady=(0, 15))
+
+        self.code_entry = ctk.CTkEntry(card, placeholder_text="6-digit code",
+                                       font=AppConfig.FONT_NORMAL, height=40, corner_radius=8)
+        self.code_entry.pack(fill="x", padx=20, pady=(0, 15))
+        self.code_entry.bind("<Return>", lambda e: self._handle_verify())
+
+        ctk.CTkButton(card, text="Verify", command=self._handle_verify,
+                      font=AppConfig.FONT_NORMAL, height=40,
+                      fg_color=AppConfig.COLOR_PRIMARY, corner_radius=8
+                      ).pack(fill="x", padx=20, pady=(0, 10))
+
+        ctk.CTkButton(card, text="Resend code", command=self._handle_resend,
+                      font=AppConfig.FONT_SMALL, height=30,
+                      fg_color="transparent", hover_color="#333333",
+                      text_color=AppConfig.COLOR_PRIMARY, corner_radius=8
+                      ).pack(fill="x", padx=20, pady=(0, 10))
+
+        self.status_label = ctk.CTkLabel(card, text="", font=AppConfig.FONT_SMALL,
+                                         text_color=AppConfig.COLOR_DANGER, wraplength=280)
+        self.status_label.pack(pady=(0, 10))
+
+    def _handle_verify(self):
+        code = self.code_entry.get().strip()
+        if not code:
+            self.status_label.configure(text="Enter the code you received", text_color=AppConfig.COLOR_DANGER)
+            return
+        try:
+            success, msg, token = self.auth.verify_login_otp(self.username, code)
+            if success:
+                self._password = None
+                self.grab_release()
+                self.destroy()
+                self.on_login(self.auth.current_user, token)
+            else:
+                self.status_label.configure(text=msg, text_color=AppConfig.COLOR_DANGER)
+        except Exception as e:
+            logger.error(f"OTP verify error: {e}", exc_info=True)
+            self.status_label.configure(text=f"Verification failed: {e}", text_color=AppConfig.COLOR_DANGER)
+
+    def _handle_resend(self):
+        try:
+            success, msg, _ = self.auth.login(self.username, self._password)
+            color = AppConfig.COLOR_SUCCESS if success else AppConfig.COLOR_DANGER
+            self.status_label.configure(text=msg, text_color=color)
+        except Exception as e:
+            logger.error(f"OTP resend error: {e}", exc_info=True)
+            self.status_label.configure(text=f"Resend failed: {e}", text_color=AppConfig.COLOR_DANGER)
+
+    def _on_cancel(self):
+        self._password = None
+        self.grab_release()
+        self.destroy()
 
 
 class RegisterDialog(ctk.CTkToplevel):
@@ -220,13 +318,15 @@ class RegisterDialog(ctk.CTkToplevel):
         role = self.role_var.get()
 
         if not username or not email or not password:
-            self.status_label.configure(text="All fields are required")
+            self.status_label.configure(text="All fields are required", text_color=AppConfig.COLOR_DANGER)
             return
 
         success, msg = self.auth.register_user(username, email, password, role)
         self.callback(success, msg)
         if success:
             self.destroy()
+        else:
+            self.status_label.configure(text=msg, text_color=AppConfig.COLOR_DANGER)
 
 
 class ChangePasswordDialog(ctk.CTkToplevel):
@@ -302,6 +402,243 @@ class ChangePasswordDialog(ctk.CTkToplevel):
             self.status_label.configure(text=msg)
 
 
+class CameraAccessDialog(ctk.CTkToplevel):
+    """
+    Gates a sensitive camera action behind BOTH password re-entry AND face
+    verification. A wrong password or a non-matching face captures a
+    10-second video + one snapshot into the Intruders log instead of just
+    silently refusing.
+    """
+
+    def __init__(self, parent, auth: AuthenticationManager, face_mgr: FaceManager,
+                 db: DatabaseManager, user: Dict, action_label: str, on_verified: Callable):
+        super().__init__(parent)
+        self.auth = auth
+        self.face_mgr = face_mgr
+        self.db = db
+        self.user = user
+        self.on_verified = on_verified
+        self.title("Verify Identity")
+        self.geometry("420x340")
+        self.configure(fg_color=AppConfig.COLOR_DARK_BG)
+        self.transient(parent)
+        self.grab_set()
+        self.protocol("WM_DELETE_WINDOW", self._on_cancel)
+
+        self._center_window()
+        self._build_ui(action_label)
+
+    def _center_window(self):
+        self.update_idletasks()
+        w, h = self.winfo_width(), self.winfo_height()
+        x = (self.winfo_screenwidth() // 2) - (w // 2)
+        y = (self.winfo_screenheight() // 2) - (h // 2)
+        self.geometry(f"{w}x{h}+{x}+{y}")
+
+    def _build_ui(self, action_label):
+        card = ctk.CTkFrame(self, fg_color="#2a2a2a", corner_radius=10)
+        card.pack(padx=20, pady=20, fill="both", expand=True)
+
+        ctk.CTkLabel(card, text=f"Verify to: {action_label}", font=AppConfig.FONT_NORMAL,
+                     text_color=AppConfig.COLOR_TEXT).pack(anchor="w", padx=20, pady=(20, 5))
+        ctk.CTkLabel(card, text="Enter your password, then click Verify.\n"
+                     "Your camera will check your face at the same time.",
+                     font=AppConfig.FONT_SMALL, text_color="#888888",
+                     justify="left").pack(anchor="w", padx=20, pady=(0, 15))
+
+        self.password_entry = ctk.CTkEntry(card, placeholder_text="Password", show="*",
+                                           font=AppConfig.FONT_NORMAL, height=40, corner_radius=8)
+        self.password_entry.pack(fill="x", padx=20, pady=(0, 15))
+        self.password_entry.bind("<Return>", lambda e: self._handle_verify())
+
+        self.verify_btn = ctk.CTkButton(card, text="Verify & Proceed", command=self._handle_verify,
+                                        font=AppConfig.FONT_NORMAL, height=40,
+                                        fg_color=AppConfig.COLOR_PRIMARY, corner_radius=8)
+        self.verify_btn.pack(fill="x", padx=20, pady=(0, 10))
+
+        ctk.CTkButton(card, text="Cancel", command=self._on_cancel,
+                      font=AppConfig.FONT_SMALL, height=30,
+                      fg_color="transparent", hover_color="#333333",
+                      text_color="#888888", corner_radius=8
+                      ).pack(fill="x", padx=20, pady=(0, 10))
+
+        self.status_label = ctk.CTkLabel(card, text="", font=AppConfig.FONT_SMALL,
+                                         text_color=AppConfig.COLOR_DANGER, wraplength=320)
+        self.status_label.pack(pady=(0, 5))
+
+    def _on_cancel(self):
+        self.grab_release()
+        self.destroy()
+
+    def _handle_verify(self):
+        password = self.password_entry.get()
+        if not password:
+            self.status_label.configure(text="Enter your password", text_color=AppConfig.COLOR_DANGER)
+            return
+
+        self.verify_btn.configure(state="disabled")
+        self.status_label.configure(text="Checking password and face - look at your camera...",
+                                    text_color="#888888")
+        self.update()
+
+        try:
+            password_ok = self.auth.verify_current_password(self.user['user_id'], password)
+
+            face_ok = False
+            frame = self.face_mgr.capture_face_from_camera(timeout_seconds=5)
+            if frame is not None:
+                verified, confidence, msg = self.face_mgr.verify_face(
+                    self.user['user_id'], image=frame, username=self.user['username'])
+                face_ok = verified
+
+            if password_ok and face_ok:
+                self.grab_release()
+                self.destroy()
+                self.on_verified()
+                return
+
+            reasons = []
+            if not password_ok:
+                reasons.append("wrong password")
+            if not face_ok:
+                reasons.append("face not recognized")
+            reason_text = " + ".join(reasons)
+
+            snapshot_path, video_path = self.face_mgr.capture_intruder_evidence()
+            self.db.add_intruder_log(
+                failed_attempts=1,
+                image_path=snapshot_path,
+                video_path=video_path,
+                ip_address=SystemInfo.get_ip_address(),
+                machine_name=SystemInfo.get_machine_name(),
+                reason=f"Camera control ({reason_text})"
+            )
+            self.db.add_log(
+                self.user['user_id'], self.user['username'], 'camera_access_denied', 'warning',
+                f"Camera control verification failed: {reason_text}",
+                SystemInfo.get_ip_address(), SystemInfo.get_machine_name()
+            )
+
+            self.verify_btn.configure(state="normal")
+            self.status_label.configure(
+                text=f"Verification failed ({reason_text}). This attempt was recorded.",
+                text_color=AppConfig.COLOR_DANGER
+            )
+        except Exception as e:
+            logger.error(f"Camera access verification error: {e}", exc_info=True)
+            self.verify_btn.configure(state="normal")
+            self.status_label.configure(text=f"Verification error: {e}", text_color=AppConfig.COLOR_DANGER)
+
+
+class PasswordGateDialog(ctk.CTkToplevel):
+    """
+    Lighter-weight sibling of CameraAccessDialog: password only, no face
+    check - for gates like View Logs. A wrong password still captures a
+    single snapshot (no video) into the Intruders log.
+    """
+
+    def __init__(self, parent, auth: AuthenticationManager, face_mgr: FaceManager,
+                 db: DatabaseManager, user: Dict, action_label: str, on_verified: Callable):
+        super().__init__(parent)
+        self.auth = auth
+        self.face_mgr = face_mgr
+        self.db = db
+        self.user = user
+        self.on_verified = on_verified
+        self.title("Verify Identity")
+        self.geometry("380x280")
+        self.configure(fg_color=AppConfig.COLOR_DARK_BG)
+        self.transient(parent)
+        self.grab_set()
+        self.protocol("WM_DELETE_WINDOW", self._on_cancel)
+
+        self._center_window()
+        self._build_ui(action_label)
+
+    def _center_window(self):
+        self.update_idletasks()
+        w, h = self.winfo_width(), self.winfo_height()
+        x = (self.winfo_screenwidth() // 2) - (w // 2)
+        y = (self.winfo_screenheight() // 2) - (h // 2)
+        self.geometry(f"{w}x{h}+{x}+{y}")
+
+    def _build_ui(self, action_label):
+        card = ctk.CTkFrame(self, fg_color="#2a2a2a", corner_radius=10)
+        card.pack(padx=20, pady=20, fill="both", expand=True)
+
+        ctk.CTkLabel(card, text=f"Verify to: {action_label}", font=AppConfig.FONT_NORMAL,
+                     text_color=AppConfig.COLOR_TEXT).pack(anchor="w", padx=20, pady=(20, 5))
+        ctk.CTkLabel(card, text="Enter your password to continue.",
+                     font=AppConfig.FONT_SMALL, text_color="#888888",
+                     justify="left").pack(anchor="w", padx=20, pady=(0, 15))
+
+        self.password_entry = ctk.CTkEntry(card, placeholder_text="Password", show="*",
+                                           font=AppConfig.FONT_NORMAL, height=40, corner_radius=8)
+        self.password_entry.pack(fill="x", padx=20, pady=(0, 15))
+        self.password_entry.bind("<Return>", lambda e: self._handle_verify())
+
+        self.verify_btn = ctk.CTkButton(card, text="Verify", command=self._handle_verify,
+                                        font=AppConfig.FONT_NORMAL, height=40,
+                                        fg_color=AppConfig.COLOR_PRIMARY, corner_radius=8)
+        self.verify_btn.pack(fill="x", padx=20, pady=(0, 10))
+
+        ctk.CTkButton(card, text="Cancel", command=self._on_cancel,
+                      font=AppConfig.FONT_SMALL, height=30,
+                      fg_color="transparent", hover_color="#333333",
+                      text_color="#888888", corner_radius=8
+                      ).pack(fill="x", padx=20, pady=(0, 10))
+
+        self.status_label = ctk.CTkLabel(card, text="", font=AppConfig.FONT_SMALL,
+                                         text_color=AppConfig.COLOR_DANGER, wraplength=320)
+        self.status_label.pack(pady=(0, 5))
+
+    def _handle_verify(self):
+        password = self.password_entry.get()
+        if not password:
+            self.status_label.configure(text="Enter your password", text_color=AppConfig.COLOR_DANGER)
+            return
+
+        self.verify_btn.configure(state="disabled")
+        self.status_label.configure(text="Checking...", text_color="#888888")
+        self.update()
+
+        try:
+            password_ok = self.auth.verify_current_password(self.user['user_id'], password)
+            if password_ok:
+                self.grab_release()
+                self.destroy()
+                self.on_verified()
+                return
+
+            snapshot_path, _ = self.face_mgr.capture_intruder_evidence(capture_video=False)
+            self.db.add_intruder_log(
+                failed_attempts=1,
+                image_path=snapshot_path,
+                ip_address=SystemInfo.get_ip_address(),
+                machine_name=SystemInfo.get_machine_name(),
+                reason="View Logs (wrong password)"
+            )
+            self.db.add_log(
+                self.user['user_id'], self.user['username'], 'logs_access_denied', 'warning',
+                'Incorrect password entered to view activity logs',
+                SystemInfo.get_ip_address(), SystemInfo.get_machine_name()
+            )
+
+            self.verify_btn.configure(state="normal")
+            self.status_label.configure(
+                text="Incorrect password. This attempt was recorded.",
+                text_color=AppConfig.COLOR_DANGER
+            )
+        except Exception as e:
+            logger.error(f"Password gate verification error: {e}", exc_info=True)
+            self.verify_btn.configure(state="normal")
+            self.status_label.configure(text=f"Verification error: {e}", text_color=AppConfig.COLOR_DANGER)
+
+    def _on_cancel(self):
+        self.grab_release()
+        self.destroy()
+
+
 class DashboardScreen(ctk.CTkFrame):
     def __init__(self, parent, user: Dict, token: str, on_logout: Callable):
         super().__init__(parent, fg_color=AppConfig.COLOR_DARK_BG)
@@ -312,12 +649,13 @@ class DashboardScreen(ctk.CTkFrame):
         self.auth = AuthenticationManager(self.db)
         self.camera_ctrl = CameraController(self.db)
         self.policy_mgr = PolicyManager(self.db)
-        self.scheduler = Scheduler(self.db)
+        self.scheduler = Scheduler(self.db, callback=self._handle_schedule_action)
         self.log_mgr = LoggingManager(self.db)
         self.report_gen = ReportGenerator(self.db)
         self.face_mgr = FaceManager(self.db)
         self.user_mgr = UserManager(self.auth, self.db)
         self.current_view = None
+        self.scheduler.start()
         self._face_stop_event = threading.Event()
         self.build_ui()
 
@@ -338,6 +676,7 @@ class DashboardScreen(ctk.CTkFrame):
 
         self.nav_buttons = {}
         self._add_nav_button("dashboard", "  Dashboard", self.show_dashboard)
+        self._add_nav_button("project_info", "  Project Info", self.handle_project_info)
         self._add_nav_button("camera", "  Camera Control", self.show_camera)
         self._add_nav_button("face", "  Face Recognition", self.show_face)
         self._add_nav_button("logs", "  Activity Logs", self.show_logs)
@@ -373,6 +712,18 @@ class DashboardScreen(ctk.CTkFrame):
         for widget in self.content_frame.winfo_children():
             widget.destroy()
 
+    def _open_file(self, path: str):
+        try:
+            if os.name == 'nt':
+                os.startfile(path)
+            else:
+                import subprocess
+                opener = 'open' if sys.platform == 'darwin' else 'xdg-open'
+                subprocess.Popen([opener, path])
+        except Exception as e:
+            logger.error(f"Error opening file {path}: {e}")
+            messagebox.showerror("Error", f"Could not open file: {e}")
+
     def _make_header(self, text: str):
         ctk.CTkLabel(self.content_frame, text=text, font=AppConfig.FONT_HEADING,
                      text_color=AppConfig.COLOR_TEXT).pack(anchor="w", padx=30, pady=20)
@@ -391,10 +742,14 @@ class DashboardScreen(ctk.CTkFrame):
         stats_frame.pack(fill="x", padx=30, pady=10)
 
         db_stats = self.db.get_database_stats()
-        self._add_stat_card(stats_frame, "Users", str(db_stats.get('users', 0)), "\U0001f465")
-        self._add_stat_card(stats_frame, "Logs", str(db_stats.get('logs', 0)), "\U0001f4cb")
-        self._add_stat_card(stats_frame, "Cameras", str(self.camera_ctrl.get_camera_count()), "\U0001f4f9")
-        self._add_stat_card(stats_frame, "Intruders", str(db_stats.get('intruder_logs', 0)), "\U0001f6a8")
+        self._add_stat_card(stats_frame, "Users", str(db_stats.get('users', 0)), "\U0001f465",
+                            command=self.show_users)
+        self._add_stat_card(stats_frame, "Logs", str(db_stats.get('logs', 0)), "\U0001f4cb",
+                            command=self.show_logs)
+        self._add_stat_card(stats_frame, "Cameras", str(self.camera_ctrl.get_camera_count()), "\U0001f4f9",
+                            command=self.show_camera)
+        self._add_stat_card(stats_frame, "Intruders", str(db_stats.get('intruder_logs', 0)), "\U0001f6a8",
+                            command=self.show_intruders)
 
         info_frame = ctk.CTkFrame(self.content_frame, fg_color="#1f1f1f", corner_radius=10)
         info_frame.pack(fill="x", padx=30, pady=10)
@@ -415,14 +770,82 @@ class DashboardScreen(ctk.CTkFrame):
         ctk.CTkLabel(info_frame, text=info_text, font=AppConfig.FONT_SMALL,
                      text_color="#aaaaaa", justify="left").pack(anchor="w", padx=20, pady=(0, 15))
 
-    def _add_stat_card(self, parent, title, value, icon):
-        card = ctk.CTkFrame(parent, fg_color="#2a2a2a", corner_radius=8)
+    def _add_stat_card(self, parent, title, value, icon, command: Callable = None):
+        card = ctk.CTkFrame(parent, fg_color="#2a2a2a", corner_radius=8,
+                            cursor="hand2" if command else "")
         card.pack(side="left", fill="both", expand=True, padx=10, pady=10)
-        ctk.CTkLabel(card, text=icon, font=("Arial", 24)).pack(pady=(10, 0))
-        ctk.CTkLabel(card, text=title, font=AppConfig.FONT_SMALL,
-                     text_color="#888888").pack(pady=5)
-        ctk.CTkLabel(card, text=value, font=AppConfig.FONT_HEADING,
-                     text_color=AppConfig.COLOR_PRIMARY).pack(pady=(0, 10))
+        widgets = [card]
+        widgets.append(ctk.CTkLabel(card, text=icon, font=("Arial", 24)))
+        widgets[-1].pack(pady=(10, 0))
+        widgets.append(ctk.CTkLabel(card, text=title, font=AppConfig.FONT_SMALL,
+                                    text_color="#888888"))
+        widgets[-1].pack(pady=5)
+        widgets.append(ctk.CTkLabel(card, text=value, font=AppConfig.FONT_HEADING,
+                                    text_color=AppConfig.COLOR_PRIMARY))
+        widgets[-1].pack(pady=(0, 10))
+
+        if command:
+            for w in widgets:
+                w.bind("<Button-1>", lambda e: command())
+                w.configure(cursor="hand2")
+
+    def handle_project_info(self):
+        try:
+            open_project_info()
+        except Exception as e:
+            logger.error(f"Error opening project info: {e}")
+            messagebox.showerror("Error", f"Could not open project info page: {e}")
+
+    # ==================== INTRUDERS ====================
+    def show_intruders(self):
+        self._clear_content()
+        self._make_header("Intruders")
+
+        records = self.db.get_intruder_logs(limit=100)
+        if not records:
+            ctk.CTkLabel(self.content_frame, text="No intruder events recorded.",
+                        font=AppConfig.FONT_NORMAL, text_color="#888888").pack(padx=30, pady=10)
+            return
+
+        scroll = self._make_scrollable_list()
+        for rec in records:
+            row = ctk.CTkFrame(scroll, fg_color="#1f1f1f", corner_radius=8)
+            row.pack(fill="x", pady=5, padx=5)
+
+            has_image = bool(rec.get('image_path')) and os.path.exists(rec['image_path'])
+            if has_image:
+                try:
+                    from PIL import Image
+                    img = ctk.CTkImage(light_image=Image.open(rec['image_path']),
+                                       size=(80, 80))
+                    ctk.CTkLabel(row, image=img, text="").pack(side="left", padx=10, pady=10)
+                except Exception as e:
+                    logger.error(f"Error loading intruder snapshot: {e}")
+                    has_image = False
+            if not has_image:
+                ctk.CTkLabel(row, text="\U0001f6a8", font=("Arial", 32),
+                            width=80).pack(side="left", padx=10, pady=10)
+
+            info_text = (
+                f"Failed attempts: {rec.get('failed_attempts', 1)}   "
+                f"Machine: {rec.get('machine_name', 'Unknown')}   "
+                f"IP: {rec.get('ip_address', 'Unknown')}\n"
+                f"Last attempt: {rec.get('last_attempt', 'Unknown')}"
+            )
+            if rec.get('reason'):
+                info_text += f"\nReason: {rec['reason']}"
+            text_col = ctk.CTkFrame(row, fg_color="transparent")
+            text_col.pack(side="left", padx=10, pady=10, fill="x", expand=True)
+            ctk.CTkLabel(text_col, text=info_text, font=AppConfig.FONT_SMALL,
+                        text_color=AppConfig.COLOR_TEXT, justify="left").pack(anchor="w")
+
+            if rec.get('video_path') and os.path.exists(rec['video_path']):
+                vpath = rec['video_path']
+                ctk.CTkButton(row, text="Play video", width=90, height=28,
+                             font=AppConfig.FONT_SMALL, fg_color="#3a3a3a",
+                             hover_color="#4a4a4a",
+                             command=lambda p=vpath: self._open_file(p)
+                             ).pack(side="right", padx=10)
 
     # ==================== CAMERA CONTROL ====================
     def show_camera(self):
@@ -544,28 +967,70 @@ class DashboardScreen(ctk.CTkFrame):
         self.show_camera()
 
     def _toggle_camera(self, device_id, enable):
-        if enable:
-            success, msg = self.camera_ctrl.enable_specific_camera(
-                device_id, self.user['user_id'], self.user['username'])
-        else:
-            success, msg = self.camera_ctrl.disable_specific_camera(
-                device_id, self.user['user_id'], self.user['username'])
-        if success:
-            self.show_camera()
-        else:
-            messagebox.showerror("Error", msg)
+        def proceed():
+            if enable:
+                success, msg = self.camera_ctrl.enable_specific_camera(
+                    device_id, self.user['user_id'], self.user['username'])
+            else:
+                success, msg = self.camera_ctrl.disable_specific_camera(
+                    device_id, self.user['user_id'], self.user['username'])
+            if success:
+                self.show_camera()
+            else:
+                messagebox.showerror("Error", msg)
+
+        label = "Enable Camera" if enable else "Disable Camera"
+        CameraAccessDialog(self, self.auth, self.face_mgr, self.db, self.user, label, proceed)
+
+    def _handle_schedule_action(self, action: str, schedule_name: str):
+        """
+        Callback invoked by Scheduler's background thread when a schedule's
+        time window is active. This is what makes schedules actually do
+        something - previously the scheduler ran but had no callback wired
+        in, so it only ever logged that it "would" act.
+        Runs on the scheduler's background thread, not the GUI thread, so
+        this only touches camera_ctrl/db (thread-safe-ish, no widget access)
+        rather than any tkinter widgets directly.
+        """
+        try:
+            if action == 'disable':
+                success, msg = self.camera_ctrl.disable_all_cameras(
+                    self.user['user_id'], self.user['username'])
+            elif action == 'enable':
+                success, msg = self.camera_ctrl.enable_all_cameras(
+                    self.user['user_id'], self.user['username'])
+            else:
+                logger.warning(f"Unknown schedule action: {action}")
+                return
+
+            self.db.add_log(
+                self.user['user_id'], self.user['username'], 'schedule_executed', 'info',
+                f"Schedule '{schedule_name}' triggered camera {action} - {msg}",
+                SystemInfo.get_ip_address(), SystemInfo.get_machine_name()
+            )
+            logger.info(f"Schedule '{schedule_name}' executed: {action} - {msg}")
+        except Exception as e:
+            logger.error(f"Error executing schedule action '{action}': {e}", exc_info=True)
 
     def _disable_all_cameras(self):
-        success, msg = self.camera_ctrl.disable_all_cameras(
-            self.user['user_id'], self.user['username'])
-        messagebox.showinfo("Camera Control", msg)
-        self.show_camera()
+        def proceed():
+            success, msg = self.camera_ctrl.disable_all_cameras(
+                self.user['user_id'], self.user['username'])
+            messagebox.showinfo("Camera Control", msg)
+            self.show_camera()
+
+        CameraAccessDialog(self, self.auth, self.face_mgr, self.db, self.user,
+                           "Disable Webcam (Block All Apps)", proceed)
 
     def _enable_all_cameras(self):
-        success, msg = self.camera_ctrl.enable_all_cameras(
-            self.user['user_id'], self.user['username'])
-        messagebox.showinfo("Camera Control", msg)
-        self.show_camera()
+        def proceed():
+            success, msg = self.camera_ctrl.enable_all_cameras(
+                self.user['user_id'], self.user['username'])
+            messagebox.showinfo("Camera Control", msg)
+            self.show_camera()
+
+        CameraAccessDialog(self, self.auth, self.face_mgr, self.db, self.user,
+                           "Enable Webcam (Allow Apps)", proceed)
 
     # ==================== FACE RECOGNITION ====================
     def show_face(self):
@@ -875,13 +1340,17 @@ class DashboardScreen(ctk.CTkFrame):
 
     # ==================== ACTIVITY LOGS ====================
     def show_logs(self):
+        PasswordGateDialog(self, self.auth, self.face_mgr, self.db, self.user,
+                           "View Activity Logs", self._render_logs)
+
+    def _render_logs(self):
         self._clear_content()
         self._make_header("Activity Logs")
 
         top_frame = ctk.CTkFrame(self.content_frame, fg_color="transparent")
         top_frame.pack(fill="x", padx=30, pady=10)
 
-        ctk.CTkButton(top_frame, text="Refresh", command=self.show_logs,
+        ctk.CTkButton(top_frame, text="Refresh", command=self._render_logs,
                       font=AppConfig.FONT_SMALL, fg_color=AppConfig.COLOR_PRIMARY,
                       corner_radius=8, height=30).pack(side="left", padx=5)
 

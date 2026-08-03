@@ -10,6 +10,7 @@ from datetime import datetime
 from typing import List, Dict, Tuple, Optional, Any
 from pathlib import Path
 import logging
+from crypto_manager import CryptoManager
 
 # Configure module logging
 logger = logging.getLogger(__name__)
@@ -32,6 +33,12 @@ class DatabaseManager:
         self.connection = None
         self._ensure_database_exists()
         self._initialize_schema()
+        try:
+            self._crypto = CryptoManager()
+        except Exception as e:
+            logger.error(f"Could not initialize log encryption, logs will be stored "
+                        f"in plaintext until this is fixed: {e}")
+            self._crypto = None
     
     def _ensure_database_exists(self):
         """Ensure database file and directory exist"""
@@ -122,6 +129,19 @@ class DatabaseManager:
                 ip_address TEXT,
                 machine_name TEXT,
                 timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE
+            )
+        """)
+
+        # One-time login codes emailed via SMTP (see email_manager.py)
+        self.execute("""
+            CREATE TABLE IF NOT EXISTS login_otp (
+                otp_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                code_hash TEXT NOT NULL,
+                expires_at TIMESTAMP NOT NULL,
+                used BOOLEAN DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE
             )
         """)
@@ -240,6 +260,15 @@ class DatabaseManager:
             if 'scope' not in existing_cols:
                 self.execute("ALTER TABLE policies ADD COLUMN scope TEXT DEFAULT 'global'")
                 logger.info("Added scope column to policies table")
+
+            cursor = self.execute("PRAGMA table_info(intruder_logs)")
+            existing_cols = {row[1] for row in cursor.fetchall()}
+            if 'video_path' not in existing_cols:
+                self.execute("ALTER TABLE intruder_logs ADD COLUMN video_path TEXT")
+                logger.info("Added video_path column to intruder_logs table")
+            if 'reason' not in existing_cols:
+                self.execute("ALTER TABLE intruder_logs ADD COLUMN reason TEXT")
+                logger.info("Added reason column to intruder_logs table")
         except sqlite3.Error as e:
             logger.warning(f"Migration warning (may be expected): {e}")
     
@@ -310,79 +339,135 @@ class DatabaseManager:
         return True
     
     # ============ LOG OPERATIONS ============
-    
+    # 'details' is encrypted at rest (AES/Fernet via CryptoManager) so that
+    # opening database/app.db directly, outside the running application,
+    # does not show readable log content. It is transparently decrypted
+    # here for every reader below, so the rest of the app (View Logs,
+    # reports, etc.) keeps working with plain strings as before.
+
     def add_log(self, user_id: int, username: str, action: str, 
                severity: str = 'info', details: str = None, 
                ip_address: str = None, machine_name: str = None) -> int:
         """Add activity log entry"""
         try:
+            stored_details = details
+            if details and self._crypto:
+                try:
+                    stored_details = self._crypto.encrypt_string(details)
+                except Exception as e:
+                    logger.error(f"Failed to encrypt log details, storing as plaintext: {e}")
             cursor = self.execute(
                 """INSERT INTO logs (user_id, username, action, severity, details, ip_address, machine_name) 
                    VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                (user_id, username, action, severity, details, ip_address, machine_name)
+                (user_id, username, action, severity, stored_details, ip_address, machine_name)
             )
             self.commit()
             return cursor.lastrowid
         except sqlite3.Error as e:
             logger.error(f"Log creation failed: {e}")
             raise
-    
+
+    def _decrypt_log_row(self, row: Dict) -> Dict:
+        """Decrypts a log row's 'details' field in place. Rows written
+        before encryption was enabled (or that fail to decrypt for any
+        reason) are left as-is rather than raising, so one bad/legacy row
+        can't break the whole log view."""
+        if row.get('details') and self._crypto:
+            try:
+                row['details'] = self._crypto.decrypt_string(row['details'])
+            except Exception:
+                pass  # legacy plaintext row, or corrupted - show as stored
+        return row
+
     def get_logs_by_user(self, user_id: int, limit: int = 100) -> List[Dict]:
         """Get logs for a specific user"""
         cursor = self.execute(
             """SELECT * FROM logs WHERE user_id = ? 
-               ORDER BY timestamp DESC LIMIT ?""",
+               ORDER BY log_id DESC LIMIT ?""",
             (user_id, limit)
         )
-        return [dict(row) for row in cursor.fetchall()]
+        return [self._decrypt_log_row(dict(row)) for row in cursor.fetchall()]
     
     def get_all_logs(self, limit: int = 500) -> List[Dict]:
         """Get all logs"""
         cursor = self.execute(
-            "SELECT * FROM logs ORDER BY timestamp DESC LIMIT ?",
+            "SELECT * FROM logs ORDER BY log_id DESC LIMIT ?",
             (limit,)
         )
-        return [dict(row) for row in cursor.fetchall()]
+        return [self._decrypt_log_row(dict(row)) for row in cursor.fetchall()]
     
     def get_logs_by_severity(self, severity: str, limit: int = 100) -> List[Dict]:
         """Get logs by severity level"""
         cursor = self.execute(
             """SELECT * FROM logs WHERE severity = ? 
-               ORDER BY timestamp DESC LIMIT ?""",
+               ORDER BY log_id DESC LIMIT ?""",
             (severity, limit)
         )
-        return [dict(row) for row in cursor.fetchall()]
+        return [self._decrypt_log_row(dict(row)) for row in cursor.fetchall()]
     
     def get_logs_by_date_range(self, start_date: str, end_date: str) -> List[Dict]:
         """Get logs within date range"""
         cursor = self.execute(
             """SELECT * FROM logs WHERE timestamp BETWEEN ? AND ? 
-               ORDER BY timestamp DESC""",
+               ORDER BY log_id DESC""",
             (start_date, end_date)
         )
-        return [dict(row) for row in cursor.fetchall()]
+        return [self._decrypt_log_row(dict(row)) for row in cursor.fetchall()]
     
     # ============ INTRUDER DETECTION ============
     
     def add_intruder_log(self, failed_attempts: int = 1, image_path: str = None,
-                        ip_address: str = None, machine_name: str = None) -> int:
+                        ip_address: str = None, machine_name: str = None,
+                        video_path: str = None, reason: str = None) -> int:
         """Log intruder detection event"""
         cursor = self.execute(
-            """INSERT INTO intruder_logs (failed_attempts, image_path, ip_address, machine_name) 
-               VALUES (?, ?, ?, ?)""",
-            (failed_attempts, image_path, ip_address, machine_name)
+            """INSERT INTO intruder_logs
+               (failed_attempts, image_path, ip_address, machine_name, video_path, reason)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (failed_attempts, image_path, ip_address, machine_name, video_path, reason)
         )
         self.commit()
         return cursor.lastrowid
     
     def get_intruder_logs(self, limit: int = 50) -> List[Dict]:
-        """Get intruder detection logs"""
+        """Get intruder detection logs.
+        Ordered by intruder_id (strictly increasing) rather than
+        last_attempt, since CURRENT_TIMESTAMP only has 1-second resolution
+        and two events in the same second would otherwise tie/misorder -
+        same class of bug as login_otp's ordering, found the same way."""
         cursor = self.execute(
-            "SELECT * FROM intruder_logs ORDER BY last_attempt DESC LIMIT ?",
+            "SELECT * FROM intruder_logs ORDER BY intruder_id DESC LIMIT ?",
             (limit,)
         )
         return [dict(row) for row in cursor.fetchall()]
     
+    # ============ LOGIN OTP OPERATIONS ============
+
+    def create_login_otp(self, user_id: int, code_hash: str, expires_at: str) -> int:
+        """Store a freshly generated one-time login code (hashed, never plaintext)"""
+        cursor = self.execute(
+            "INSERT INTO login_otp (user_id, code_hash, expires_at) VALUES (?, ?, ?)",
+            (user_id, code_hash, expires_at)
+        )
+        self.commit()
+        return cursor.lastrowid
+
+    def get_latest_login_otp(self, user_id: int):
+        """Get the most recently issued OTP for this user.
+        Ordered by otp_id (strictly increasing) rather than created_at,
+        since CURRENT_TIMESTAMP only has 1-second resolution and two codes
+        requested within the same second would otherwise tie."""
+        cursor = self.execute(
+            "SELECT * FROM login_otp WHERE user_id = ? ORDER BY otp_id DESC LIMIT 1",
+            (user_id,)
+        )
+        row = cursor.fetchone()
+        return dict(row) if row else None
+
+    def mark_login_otp_used(self, otp_id: int):
+        self.execute("UPDATE login_otp SET used = 1 WHERE otp_id = ?", (otp_id,))
+        self.commit()
+
     # ============ POLICY OPERATIONS ============
     
     def create_policy(self, policy_name: str, description: str = None,

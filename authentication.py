@@ -5,6 +5,8 @@ Handles user registration, login, password management, and session management
 
 import uuid
 import secrets
+import hashlib
+import sqlite3
 from datetime import datetime, timedelta
 from typing import Optional, Tuple, Dict, Any
 import logging
@@ -12,6 +14,7 @@ import logging
 from database import DatabaseManager
 from crypto_manager import CryptoManager
 from utils import ValidationUtils, SystemInfo, DateTimeUtils
+import email_manager as EmailManager
 
 logger = logging.getLogger(__name__)
 
@@ -91,7 +94,16 @@ class AuthenticationManager:
             
             logger.info(f"User registered successfully: {username}")
             return True, f"User '{username}' registered successfully."
-        
+
+        except sqlite3.IntegrityError as e:
+            logger.error(f"Registration failed (duplicate): {e}")
+            if 'email' in str(e).lower():
+                return False, ("That email is already registered to another account. "
+                              "Use a different email, or log in with the existing account instead.")
+            elif 'username' in str(e).lower():
+                return False, "That username is already taken. Please choose another."
+            return False, "An account with these details already exists."
+
         except Exception as e:
             logger.error(f"Registration failed: {e}")
             return False, "Registration failed. Please try again."
@@ -139,31 +151,130 @@ class AuthenticationManager:
                 logger.warning(f"Login failed: Invalid password - {username}")
                 return False, "Invalid username or password.", None
             
-            # Create session token
-            token = self._create_session_token(user['user_id'])
-            
-            # Update last login
-            self.db.update_user(user['user_id'], last_login=DateTimeUtils.get_current_timestamp())
-            
-            # Log successful login
-            self.db.add_log(
-                user['user_id'], username, 'login', 'info',
-                'User logged in successfully',
-                SystemInfo.get_ip_address(),
-                SystemInfo.get_machine_name()
-            )
-            
-            # Store current user
-            self.current_user = user
-            self.current_token = token
-            
-            logger.info(f"User logged in successfully: {username}")
-            return True, "Login successful.", token
-        
+            # Username + password are correct. Full login now requires a
+            # one-time code emailed to the user - see verify_login_otp().
+            # No session token is created here on purpose.
+            otp_code = f"{secrets.randbelow(1_000_000):06d}"
+            otp_hash = hashlib.sha256(otp_code.encode('utf-8')).hexdigest()
+            expires_at = (datetime.now() + timedelta(minutes=5)).isoformat()
+            self.db.create_login_otp(user['user_id'], otp_hash, expires_at)
+
+            sent, detail, actually_emailed = EmailManager.send_otp_email(
+                user['email'], otp_code, username)
+            if not sent:
+                logger.error(f"Could not send login OTP for {username}: {detail}")
+                return False, f"Could not send verification code ({detail}).", None
+
+            logger.info(f"OTP issued for user {username}, awaiting verification "
+                       f"(actually_emailed={actually_emailed})")
+            if actually_emailed:
+                status_msg = f"Verification code sent to {self._mask_email(user['email'])}."
+            else:
+                status_msg = ("Email isn't set up yet - check the console/terminal "
+                             "window this app is running in for your code.")
+            return True, status_msg, None
+
         except Exception as e:
             logger.error(f"Login error: {e}")
             return False, "Login failed. Please try again.", None
-    
+
+    def verify_login_otp(self, username: str, code: str) -> Tuple[bool, str, Optional[str]]:
+        """
+        Second step of login: check the emailed one-time code and, if it
+        matches and hasn't expired, create the real session token.
+
+        Args:
+            username: Username (same one passed to login())
+            code: The code the user typed in
+
+        Returns:
+            Tuple (success: bool, message: str, token: Optional[str])
+        """
+        try:
+            user = self.db.get_user_by_username(username)
+            if not user:
+                return False, "Invalid username or password.", None
+
+            otp_record = self.db.get_latest_login_otp(user['user_id'])
+            if not otp_record:
+                return False, "No verification code was requested. Please log in again.", None
+
+            if otp_record['used']:
+                return False, "This code has already been used. Please log in again.", None
+
+            if datetime.now() > datetime.fromisoformat(otp_record['expires_at']):
+                return False, "This code has expired. Please log in again.", None
+
+            entered_hash = hashlib.sha256(code.strip().encode('utf-8')).hexdigest()
+            if entered_hash != otp_record['code_hash']:
+                self.db.add_intruder_log(
+                    failed_attempts=1,
+                    ip_address=SystemInfo.get_ip_address(),
+                    machine_name=SystemInfo.get_machine_name()
+                )
+                self.db.add_log(
+                    user['user_id'], username, 'otp_failed', 'warning',
+                    'Incorrect verification code entered',
+                    SystemInfo.get_ip_address(),
+                    SystemInfo.get_machine_name()
+                )
+                logger.warning(f"Login failed: incorrect OTP - {username}")
+                return False, "Incorrect verification code.", None
+
+            self.db.mark_login_otp_used(otp_record['otp_id'])
+
+            # Create session token
+            token = self._create_session_token(user['user_id'])
+
+            # Update last login
+            self.db.update_user(user['user_id'], last_login=DateTimeUtils.get_current_timestamp())
+
+            # Log successful login
+            self.db.add_log(
+                user['user_id'], username, 'login', 'info',
+                'User logged in successfully (OTP verified)',
+                SystemInfo.get_ip_address(),
+                SystemInfo.get_machine_name()
+            )
+
+            # Store current user
+            self.current_user = user
+            self.current_token = token
+
+            logger.info(f"User logged in successfully: {username}")
+            return True, "Login successful.", token
+
+        except Exception as e:
+            logger.error(f"OTP verification error: {e}")
+            return False, "Verification failed. Please try again.", None
+
+    @staticmethod
+    def _mask_email(email: str) -> str:
+        try:
+            local, domain = email.split('@', 1)
+            if len(local) <= 2:
+                masked = local[0] + '*'
+            else:
+                masked = local[0] + '*' * (len(local) - 2) + local[-1]
+            return f"{masked}@{domain}"
+        except Exception:
+            return email
+
+    def verify_current_password(self, user_id: int, password: str) -> bool:
+        """
+        Re-checks a password against a user's stored hash, for gating
+        sensitive in-app actions (camera control, viewing logs) - separate
+        from login()/verify_login_otp(), no session/token/OTP involved.
+        """
+        try:
+            user = self.db.get_user_by_id(user_id)
+            if not user:
+                return False
+            return CryptoManager.verify_password(password, user['password_hash'])
+        except Exception as e:
+            logger.error(f"verify_current_password error: {e}")
+            return False
+
     def logout(self) -> Tuple[bool, str]:
         """
         Logout current user

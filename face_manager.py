@@ -54,6 +54,11 @@ logger = logging.getLogger(__name__)
 
 FACE_CASCADE_PATH = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
 
+# The project already ships a top-level intruder_images/ folder for exactly
+# this purpose - save evidence there directly rather than nested under
+# assets/faces/, so it's where you'd actually go looking for it.
+_INTRUDER_IMAGES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'intruder_images')
+
 # Two small files enable the high-accuracy DNN backend - see download_models.py.
 _MODELS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'models')
 _YUNET_MODEL = os.path.join(_MODELS_DIR, 'face_detection_yunet_2023mar.onnx')
@@ -127,6 +132,7 @@ class FaceManager:
         FileUtils.ensure_dir_exists(self.faces_dir)
         FileUtils.ensure_dir_exists(os.path.join(self.faces_dir, 'registered'))
         FileUtils.ensure_dir_exists(os.path.join(self.faces_dir, 'failed'))
+        FileUtils.ensure_dir_exists(_INTRUDER_IMAGES_DIR)
 
     def capture_face_from_camera(self, camera_index: int = 0,
                                 timeout_seconds: int = 5) -> Optional[np.ndarray]:
@@ -155,6 +161,80 @@ class FaceManager:
         except Exception as e:
             logger.error(f"Error capturing face: {e}")
             return None
+
+    def capture_intruder_evidence(self, camera_index: int = 0,
+                                 video_seconds: float = 10.0,
+                                 fps: float = 15.0,
+                                 capture_video: bool = True) -> Tuple[Optional[str], Optional[str]]:
+        """
+        Records evidence after a failed password/face check, for the
+        Intruders log. Best-effort: returns (None, None) rather than raising
+        if no camera is available, so a denied action is never blocked by
+        evidence capture failing.
+
+        Args:
+            capture_video: if False, only a single snapshot is taken (no
+                .avi file at all) - used for lighter-weight gates like
+                View Logs, where the spec calls for one photo, not a video.
+
+        Returns:
+            (snapshot_path, video_path) - either may be None if unavailable
+            or not requested.
+        """
+        cap = None
+        writer = None
+        try:
+            cap = cv2.VideoCapture(camera_index)
+            if not cap.isOpened():
+                logger.warning("capture_intruder_evidence: no camera available")
+                return None, None
+
+            # Let auto-exposure/white-balance settle. Many webcams return a
+            # dark/washed-out frame for the first several reads right after
+            # opening, before their calibration finishes - discard those
+            # rather than saving the intruder's first (bad) frame as evidence.
+            for _ in range(15):
+                cap.read()
+
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            snapshot_path = os.path.join(_INTRUDER_IMAGES_DIR, f'intruder_{timestamp}.jpg')
+            video_path = os.path.join(_INTRUDER_IMAGES_DIR, f'intruder_{timestamp}.avi')
+
+            ret, first_frame = cap.read()
+            if not ret:
+                cap.release()
+                return None, None
+
+            cv2.imwrite(snapshot_path, first_frame)
+
+            if capture_video:
+                h, w = first_frame.shape[:2]
+                fourcc = cv2.VideoWriter_fourcc(*'XVID')
+                writer = cv2.VideoWriter(video_path, fourcc, fps, (w, h))
+                if writer.isOpened():
+                    writer.write(first_frame)
+
+                start = datetime.now()
+                while (datetime.now() - start).total_seconds() < video_seconds:
+                    ret, frame = cap.read()
+                    if not ret:
+                        break
+                    if writer.isOpened():
+                        writer.write(frame)
+
+            return (
+                snapshot_path if os.path.exists(snapshot_path) else None,
+                (video_path if (capture_video and writer is not None and writer.isOpened()
+                                and os.path.exists(video_path)) else None),
+            )
+        except Exception as e:
+            logger.error(f"Error capturing intruder evidence: {e}")
+            return None, None
+        finally:
+            if writer is not None:
+                writer.release()
+            if cap is not None:
+                cap.release()
 
     def load_image(self, image_path: str) -> Optional[np.ndarray]:
         try:

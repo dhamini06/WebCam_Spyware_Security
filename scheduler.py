@@ -43,6 +43,16 @@ class Schedule:
         self.recurrence = recurrence
         self.is_active = is_active
         self.created_at = created_at or DateTimeUtils.get_current_timestamp()
+
+    @property
+    def name(self) -> str:
+        """Human-readable label. Schedules don't have a stored name field,
+        but _execute_schedule references schedule.name for logging - this
+        synthesizes one from the fields that do exist rather than throwing
+        an AttributeError every time a schedule fires (which is what was
+        happening before: silently caught by _execute_schedule's own
+        try/except, so schedules never visibly executed at all)."""
+        return f"Schedule #{self.schedule_id} ({self.start_time}-{self.end_time} {self.action})"
     
     def is_active_now(self) -> bool:
         """Check if schedule should be active right now"""
@@ -60,9 +70,15 @@ class Schedule:
             current_day = datetime.now().strftime('%A')
             # TODO: Store day of week separately
         
-        # Check time
+        # Check time. A plain start<=now<=end comparison can never be true
+        # for a window that crosses midnight (e.g. 22:00-07:00 sleep hours),
+        # since "22:00" > "07:00" lexicographically - handle that case
+        # separately rather than silently never firing.
         current_time = datetime.now().strftime('%H:%M')
-        return self.start_time <= current_time <= self.end_time
+        if self.start_time <= self.end_time:
+            return self.start_time <= current_time <= self.end_time
+        else:
+            return current_time >= self.start_time or current_time <= self.end_time
     
     def to_dict(self) -> Dict:
         """Convert to dictionary"""
