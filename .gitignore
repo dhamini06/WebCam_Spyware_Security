@@ -16,3 +16,4 @@ assets/faces/
 *.exe
 
 database/.encryption_key
+database/*.encryption_key*
