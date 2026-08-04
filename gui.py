@@ -184,9 +184,20 @@ class OtpDialog(ctk.CTkToplevel):
         ctk.CTkLabel(card, text="Enter Verification Code", font=AppConfig.FONT_NORMAL,
                      text_color=AppConfig.COLOR_TEXT).pack(anchor="w", padx=20, pady=(20, 5))
         delivery_text = self._delivery_message or "We emailed a 6-digit code to your registered address."
-        ctk.CTkLabel(card, text=delivery_text,
-                     font=AppConfig.FONT_SMALL, text_color="#888888", wraplength=280,
-                     justify="left").pack(anchor="w", padx=20, pady=(0, 15))
+
+        import re
+        code_match = re.search(r'\b(\d{6})\b', delivery_text)
+        if code_match and "sent to" not in delivery_text:
+            ctk.CTkLabel(card, text="Your code (shown because email isn't configured):",
+                         font=AppConfig.FONT_SMALL, text_color="#888888", wraplength=280,
+                         justify="left").pack(anchor="w", padx=20, pady=(0, 5))
+            ctk.CTkLabel(card, text=code_match.group(1),
+                         font=("Arial", 34, "bold"), text_color=AppConfig.COLOR_PRIMARY,
+                         justify="center").pack(anchor="w", padx=20, pady=(0, 5))
+        else:
+            ctk.CTkLabel(card, text=delivery_text,
+                         font=AppConfig.FONT_SMALL, text_color="#888888", wraplength=280,
+                         justify="left").pack(anchor="w", padx=20, pady=(0, 15))
 
         self.code_entry = ctk.CTkEntry(card, placeholder_text="6-digit code",
                                        font=AppConfig.FONT_NORMAL, height=40, corner_radius=8)

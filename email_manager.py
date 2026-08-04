@@ -35,9 +35,9 @@ FROM_NAME = "Webcam Spyware Security"
 # ---------------------
 
 # While True: if SMTP isn't configured yet (or a send fails), the OTP is
-# also printed to the console/log so you can keep testing the app without
-# email set up. Set this to False once real SMTP credentials are in place
-# and you're ready for real use - otherwise codes end up visible in logs.
+# shown in the app's login dialog instead of email, so you can keep testing
+# the app without email set up. Set this to False once real SMTP credentials
+# are in place and you're ready for real use.
 DEBUG_PRINT_OTP = True
 
 _NOT_CONFIGURED = SMTP_USERNAME.startswith("your.sender.email")
@@ -46,16 +46,12 @@ _NOT_CONFIGURED = SMTP_USERNAME.startswith("your.sender.email")
 def send_otp_email(to_email: str, otp_code: str, username: str = "") -> Tuple[bool, str, bool]:
     """Sends the one-time login code.
     Returns (success, message, actually_emailed) - actually_emailed is False
-    whenever the code only went to the console/log (not configured, or a
-    real send failed), so the caller can tell the user where to actually
-    look instead of just saying "check your email" every time."""
-    if DEBUG_PRINT_OTP:
-        print(f"\n[DEBUG_PRINT_OTP] Login code for '{username or to_email}': {otp_code}\n")
-        logger.info(f"[DEBUG_PRINT_OTP] OTP for {username or to_email}: {otp_code}")
+    whenever SMTP isn't configured or the send failed, so the caller can
+    show the code to the user directly instead of saying "check your email"."""
 
     if _NOT_CONFIGURED:
         msg = ("SMTP is not configured yet - edit email_manager.py with real "
-               "credentials. The code was printed to the console instead.")
+               "credentials. The code is shown in the app's login dialog instead.")
         logger.warning(msg)
         return (True, msg, False) if DEBUG_PRINT_OTP else (False, msg, False)
 
@@ -82,7 +78,7 @@ def send_otp_email(to_email: str, otp_code: str, username: str = "") -> Tuple[bo
     except Exception as e:
         logger.error(f"Failed to send OTP email: {e}")
         if DEBUG_PRINT_OTP:
-            return True, f"Email send failed ({e}) but code was printed to console.", False
+            return True, f"Email send failed ({e}) - the code is shown in the app's login dialog.", False
         return False, str(e), False
 
 

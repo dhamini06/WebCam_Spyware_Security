@@ -170,8 +170,8 @@ class AuthenticationManager:
             if actually_emailed:
                 status_msg = f"Verification code sent to {self._mask_email(user['email'])}."
             else:
-                status_msg = ("Email isn't set up yet - check the console/terminal "
-                             "window this app is running in for your code.")
+                status_msg = (f"Email isn't set up yet - your verification code is: "
+                              f"{otp_code}")
             return True, status_msg, None
 
         except Exception as e:
