@@ -23,8 +23,8 @@ COMPANY_EMAIL = "contact@suprajatechnologies.com"
 DEVELOPERS = [
     ("K. Dhamini", "ST#IS#9540", "dhamini467@gmail.com"),
     ("Ande Manjunath", "ST#IS#9533", "manjunath13556d@gmail.com"),
-    ("Shaik Mohammad Sadiq", "9565", "Sadiqshaik0402@gmail.com"),
-    ("Kadire Harsha Vardhan", "9566", "harshayadavkadire@gmail.com"),
+    ("Shaik Mohammad Sadiq", "ST#IS#9565", "Sadiqshaik0402@gmail.com"),
+    ("Kadire Harsha Vardhan", "ST#IS#9566", "harshayadavkadire@gmail.com"),
 ]
 
 _HTML_TEMPLATE = """<!DOCTYPE html>
