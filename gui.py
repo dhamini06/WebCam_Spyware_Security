@@ -21,7 +21,7 @@ from face_manager import FaceManager
 from logging_manager import LoggingManager
 from report_generator import ReportGenerator
 from utils import SystemInfo, DateTimeUtils
-from project_info import open_project_info
+from project_info import get_project_info
 
 logger = logging.getLogger(__name__)
 
@@ -791,10 +791,43 @@ class DashboardScreen(ctk.CTkFrame):
 
     def handle_project_info(self):
         try:
-            open_project_info()
+            self._clear_content()
+            self._make_header("Project Information")
+
+            info = get_project_info()
+
+            scroll = self._make_scrollable_list()
+
+            card = ctk.CTkFrame(scroll, fg_color="#1f1f1f", corner_radius=10)
+            card.pack(fill="x", padx=10, pady=5)
+
+            ctk.CTkLabel(card, text=info['project_name'], font=AppConfig.FONT_HEADING,
+                         text_color=AppConfig.COLOR_TEXT).pack(anchor="w", padx=20, pady=(15, 5))
+            ctk.CTkLabel(card, text=info['project_description'], font=AppConfig.FONT_NORMAL,
+                         text_color="#aaaaaa", justify="left", wraplength=700).pack(
+                anchor="w", padx=20, pady=(0, 10))
+            ctk.CTkLabel(card, text=f"Company: {info['company_name']}",
+                         font=AppConfig.FONT_NORMAL, text_color=AppConfig.COLOR_PRIMARY).pack(
+                anchor="w", padx=20, pady=(0, 15))
+
+            ctk.CTkLabel(scroll, text="Development Team", font=AppConfig.FONT_HEADING,
+                         text_color=AppConfig.COLOR_TEXT).pack(anchor="w", padx=20, pady=(15, 5))
+
+            for name, dev_id, email in info['developers']:
+                row = ctk.CTkFrame(scroll, fg_color="#1f1f1f", corner_radius=8)
+                row.pack(fill="x", padx=10, pady=3)
+                ctk.CTkLabel(row, text="\U0001f464", font=("Arial", 20), width=40).pack(
+                    side="left", padx=10, pady=10)
+                text_col = ctk.CTkFrame(row, fg_color="transparent")
+                text_col.pack(side="left", padx=10, pady=10, fill="x", expand=True)
+                ctk.CTkLabel(text_col, text=name, font=AppConfig.FONT_NORMAL,
+                             text_color=AppConfig.COLOR_TEXT, justify="left").pack(anchor="w")
+                ctk.CTkLabel(text_col, text=f"{dev_id}   |   {email}",
+                             font=AppConfig.FONT_SMALL, text_color="#888888",
+                             justify="left").pack(anchor="w")
         except Exception as e:
-            logger.error(f"Error opening project info: {e}")
-            messagebox.showerror("Error", f"Could not open project info page: {e}")
+            logger.error(f"Error showing project info: {e}")
+            messagebox.showerror("Error", f"Could not show project info: {e}")
 
     # ==================== INTRUDERS ====================
     def show_intruders(self):
