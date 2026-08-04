@@ -12,16 +12,20 @@ import os
 import tempfile
 import webbrowser
 
-DEVELOPER_NAME = "Your Name Here"
-DEVELOPER_ID = "Your Employee / Intern ID"
-DEVELOPER_EMAIL = "your.email@example.com"
-
 PROJECT_START_DATE = "01-DEC-2025"
 PROJECT_END_DATE = "31-DEC-2025"
 PROJECT_STATUS = "Completed"
 
 COMPANY_NAME = "Supraja Technologies"
 COMPANY_EMAIL = "contact@suprajatechnologies.com"
+
+# (name, employee/intern ID, email) for every team member.
+DEVELOPERS = [
+    ("K. Dhamini", "ST#IS#9540", "dhamini467@gmail.com"),
+    ("Ande Manjunath", "9533", "manjunath13556d@gmail.com"),
+    ("Shaik Mohammad Sadiq", "9565", "Sadiqshaik0402@gmail.com"),
+    ("Kadire Harsha Vardhan", "9566", "harshayadavkadire@gmail.com"),
+]
 
 _HTML_TEMPLATE = """<!DOCTYPE html>
 <html>
@@ -49,8 +53,8 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
 <body>
   <h1>Project Information</h1>
   <p class="intro">
-    This project was developed by <strong>{developer_name}</strong> as part of a
-    <strong>Cyber Security Internship</strong> with <strong>{company_name}</strong>.
+    This project was developed by the team of <strong>{dev_count}</strong> interns listed below
+    as part of a <strong>Cyber Security Internship</strong> with <strong>{company_name}</strong>.
     This project is designed to <strong>secure webcam access on Windows devices and
     protect against unauthorized (spyware-style) camera activity</strong>.
   </p>
@@ -68,9 +72,8 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
 
   <h2>Developer Details</h2>
   <table>
-    <tr><th>Name</th><td class="placeholder">{dev_name}</td></tr>
-    <tr><th>Employee / Intern ID</th><td class="placeholder">{dev_id}</td></tr>
-    <tr><th>Email</th><td class="placeholder">{dev_email}</td></tr>
+    <tr><th>Name</th><th>Employee / Intern ID</th><th>Email</th></tr>
+    {dev_rows}
   </table>
 
   <h2>Company Details</h2>
@@ -85,11 +88,13 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
 
 def generate_project_info_html() -> str:
     """Builds the project info HTML and writes it to a temp file. Returns the file path."""
+    dev_rows = "".join(
+        f"<tr><td>{name}</td><td>{dev_id}</td><td>{email}</td></tr>"
+        for name, dev_id, email in DEVELOPERS
+    )
     html = _HTML_TEMPLATE.format(
-        developer_name=DEVELOPER_NAME,
-        dev_name=DEVELOPER_NAME,
-        dev_id=DEVELOPER_ID,
-        dev_email=DEVELOPER_EMAIL,
+        dev_count=len(DEVELOPERS),
+        dev_rows=dev_rows,
         start_date=PROJECT_START_DATE,
         end_date=PROJECT_END_DATE,
         status=PROJECT_STATUS,
