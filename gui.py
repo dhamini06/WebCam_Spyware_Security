@@ -453,7 +453,7 @@ class CameraAccessDialog(ctk.CTkToplevel):
         ctk.CTkLabel(card, text=f"Verify to: {action_label}", font=AppConfig.FONT_NORMAL,
                      text_color=AppConfig.COLOR_TEXT).pack(anchor="w", padx=20, pady=(20, 5))
         ctk.CTkLabel(card, text="Enter your password, then click Verify.\n"
-                     "Your camera will check your face at the same time.",
+                     "If the password is wrong, your camera will also check your face.",
                      font=AppConfig.FONT_SMALL, text_color="#888888",
                      justify="left").pack(anchor="w", padx=20, pady=(0, 15))
 
@@ -496,13 +496,17 @@ class CameraAccessDialog(ctk.CTkToplevel):
             password_ok = self.auth.verify_current_password(self.user['user_id'], password)
 
             face_ok = False
-            frame = self.face_mgr.capture_face_from_camera(timeout_seconds=5)
-            if frame is not None:
-                verified, confidence, msg = self.face_mgr.verify_face(
-                    self.user['user_id'], image=frame, username=self.user['username'])
-                face_ok = verified
+            if not password_ok:
+                # Correct password is sufficient on its own; only fall back
+                # to the camera when the password is wrong. This avoids
+                # blocking legitimate users who haven't registered a face.
+                frame = self.face_mgr.capture_face_from_camera(timeout_seconds=5)
+                if frame is not None:
+                    verified, confidence, msg = self.face_mgr.verify_face(
+                        self.user['user_id'], image=frame, username=self.user['username'])
+                    face_ok = verified
 
-            if password_ok and face_ok:
+            if password_ok or face_ok:
                 self.grab_release()
                 self.destroy()
                 self.on_verified()
