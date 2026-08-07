@@ -8,6 +8,8 @@ import os
 import ctypes
 from pathlib import Path
 
+from utils import AppPaths
+
 
 def is_admin():
     try:
@@ -35,9 +37,9 @@ if not is_admin():
     request_admin()
 
 
-# Setup logging
-log_dir = Path(__file__).parent / "logs"
-log_dir.mkdir(exist_ok=True)
+# Setup logging - use the persistent data folder so logs survive a restart
+log_dir = Path(AppPaths.logs_dir())
+log_dir.mkdir(parents=True, exist_ok=True)
 
 logging.basicConfig(
     level=logging.INFO,

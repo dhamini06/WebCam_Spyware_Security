@@ -11,6 +11,7 @@ from typing import List, Dict, Tuple, Optional, Any
 from pathlib import Path
 import logging
 from crypto_manager import CryptoManager
+from utils import AppPaths
 
 # Configure module logging
 logger = logging.getLogger(__name__)
@@ -27,10 +28,13 @@ class DatabaseManager:
             db_path: Path to SQLite database file. Defaults to database/app.db
         """
         if db_path is None:
-            db_path = os.path.join(os.path.dirname(__file__), 'database', 'app.db')
+            db_path = os.path.join(AppPaths.database_dir(), 'app.db')
         
         self.db_path = db_path
         self.connection = None
+        # In frozen builds, pull the bundled DB + key into a persistent
+        # location first so seeded demo data and encryption survive the run.
+        AppPaths.seed_bundled_database()
         self._ensure_database_exists()
         self._initialize_schema()
         try:
@@ -554,6 +558,27 @@ class DatabaseManager:
             "SELECT * FROM schedules WHERE is_active = 1 ORDER BY start_time"
         )
         return [dict(row) for row in cursor.fetchall()]
+
+    def update_schedule(self, schedule_id: int, **kwargs) -> bool:
+        """Update schedule fields (start_time, end_time, action, recurrence, is_active)"""
+        allowed_fields = {'start_time', 'end_time', 'action', 'recurrence', 'is_active', 'policy_id'}
+        fields = {k: v for k, v in kwargs.items() if k in allowed_fields}
+
+        if not fields:
+            return False
+
+        set_clause = ", ".join([f"{k} = ?" for k in fields.keys()])
+        values = list(fields.values()) + [schedule_id]
+
+        self.execute(f"UPDATE schedules SET {set_clause} WHERE schedule_id = ?", values)
+        self.commit()
+        return True
+
+    def delete_schedule(self, schedule_id: int) -> bool:
+        """Permanently delete a schedule"""
+        self.execute("DELETE FROM schedules WHERE schedule_id = ?", (schedule_id,))
+        self.commit()
+        return True
     
     # ============ SETTINGS OPERATIONS ============
     

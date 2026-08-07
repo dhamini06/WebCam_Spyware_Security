@@ -20,7 +20,7 @@ from scheduler import Scheduler
 from face_manager import FaceManager
 from logging_manager import LoggingManager
 from report_generator import ReportGenerator
-from utils import SystemInfo, DateTimeUtils
+from utils import SystemInfo, DateTimeUtils, AppPaths
 from project_info import get_project_info
 
 logger = logging.getLogger(__name__)
@@ -299,13 +299,19 @@ class RegisterDialog(ctk.CTkToplevel):
                                            show="*", font=AppConfig.FONT_NORMAL, height=35, corner_radius=8)
         self.password_entry.pack(fill="x", padx=20, pady=(0, 10))
 
-        ctk.CTkLabel(card, text="Role", font=AppConfig.FONT_SMALL,
-                     text_color=AppConfig.COLOR_TEXT).pack(anchor="w", padx=20, pady=(0, 5))
         self.role_var = ctk.StringVar(value="employee")
-        role_menu = ctk.CTkOptionMenu(card, variable=self.role_var,
-                                      values=["employee", "admin"],
-                                      font=AppConfig.FONT_NORMAL, height=35, corner_radius=8)
-        role_menu.pack(fill="x", padx=20, pady=(0, 15))
+        # Public self-registration is Employee-only unless the system has no
+        # admin at all yet (fresh bootstrap) - otherwise anyone could just
+        # create an admin account for themselves.
+        if self._no_admin_exists():
+            ctk.CTkLabel(card, text="Role (first admin setup)", font=AppConfig.FONT_SMALL,
+                         text_color=AppConfig.COLOR_TEXT).pack(anchor="w", padx=20, pady=(0, 3))
+            ctk.CTkOptionMenu(card, variable=self.role_var, values=["employee", "admin"],
+                              font=AppConfig.FONT_NORMAL, height=35, corner_radius=8,
+                              ).pack(fill="x", padx=20, pady=(0, 10))
+        else:
+            ctk.CTkLabel(card, text="Role: Employee", font=AppConfig.FONT_SMALL,
+                         text_color="#aaaaaa").pack(anchor="w", padx=20, pady=(0, 10))
 
         ctk.CTkButton(card, text="Register", command=self._handle_register,
                       font=AppConfig.FONT_NORMAL, height=40,
@@ -321,6 +327,15 @@ class RegisterDialog(ctk.CTkToplevel):
         self.status_label = ctk.CTkLabel(card, text="", font=AppConfig.FONT_SMALL,
                                          text_color=AppConfig.COLOR_DANGER)
         self.status_label.pack(pady=(0, 5))
+
+    def _no_admin_exists(self) -> bool:
+        """True only when there is not a single active admin in the system."""
+        try:
+            users = self.auth.db.get_all_users()
+            return not any(u.get('role') == 'admin' and u.get('is_active')
+                           for u in users)
+        except Exception:
+            return False
 
     def _handle_register(self):
         username = self.username_entry.get().strip()
@@ -1434,7 +1449,7 @@ class DashboardScreen(ctk.CTkFrame):
 
     def _export_logs_json(self):
         path = self.log_mgr.export_logs_json(
-            os.path.join("reports", f"logs_export_{DateTimeUtils.get_current_date()}.json"))
+            os.path.join(AppPaths.reports_dir(), f"logs_export_{DateTimeUtils.get_current_date()}.json"))
         if path:
             messagebox.showinfo("Export", f"Logs exported to {path}")
         else:
@@ -1442,7 +1457,7 @@ class DashboardScreen(ctk.CTkFrame):
 
     def _export_logs_csv(self):
         path = self.log_mgr.export_logs_csv(
-            os.path.join("reports", f"logs_export_{DateTimeUtils.get_current_date()}.csv"))
+            os.path.join(AppPaths.reports_dir(), f"logs_export_{DateTimeUtils.get_current_date()}.csv"))
         if path:
             messagebox.showinfo("Export", f"Logs exported to {path}")
         else:
@@ -1473,7 +1488,8 @@ class DashboardScreen(ctk.CTkFrame):
                       font=AppConfig.FONT_SMALL, fg_color=AppConfig.COLOR_DANGER,
                       corner_radius=8, height=35).pack(side="left", padx=5)
 
-        existing = os.listdir("reports") if os.path.exists("reports") else []
+        reports_dir = AppPaths.reports_dir()
+        existing = os.listdir(reports_dir) if os.path.exists(reports_dir) else []
         if existing:
             ctk.CTkLabel(self.content_frame, text="Generated Reports", font=AppConfig.FONT_SUBHEADING,
                          text_color=AppConfig.COLOR_TEXT).pack(anchor="w", padx=30, pady=(20, 5))

@@ -11,7 +11,7 @@ from typing import Dict, List, Optional
 import logging
 
 from database import DatabaseManager
-from utils import FileUtils, DateTimeUtils
+from utils import FileUtils, DateTimeUtils, AppPaths
 
 logger = logging.getLogger(__name__)
 
@@ -51,9 +51,7 @@ class ReportGenerator:
             output_dir: Output directory for reports
         """
         self.db = db or DatabaseManager()
-        self.output_dir = output_dir or os.path.join(
-            os.path.dirname(__file__), 'reports'
-        )
+        self.output_dir = output_dir or AppPaths.reports_dir()
         FileUtils.ensure_dir_exists(self.output_dir)
         logger.info(f"Report generator initialized: {self.output_dir}")
     

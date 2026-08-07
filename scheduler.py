@@ -221,6 +221,12 @@ class Scheduler:
                 if hasattr(schedule, key):
                     setattr(schedule, key, value)
             
+            # Persist to database so enable/disable changes survive a restart
+            try:
+                self.db.update_schedule(schedule_id, **kwargs)
+            except Exception as e:
+                logger.warning(f"Could not persist schedule update to database: {e}")
+            
             logger.info(f"Schedule updated: {schedule_id}")
             return True
         
@@ -241,6 +247,12 @@ class Scheduler:
         try:
             if schedule_id not in self.schedules:
                 return False
+            
+            # Persist to database so the deletion survives a restart
+            try:
+                self.db.delete_schedule(schedule_id)
+            except Exception as e:
+                logger.warning(f"Could not persist schedule deletion to database: {e}")
             
             # Delete from memory
             del self.schedules[schedule_id]
@@ -311,9 +323,12 @@ class Scheduler:
                     last_action_time = self.last_action.get(schedule_id, None)
                     current_time = datetime.now()
                     
-                    # Execute if first time or enough time has passed (1 hour)
+                    # Execute if first time or enough time has passed (1 hour).
+                    # total_seconds() (not .seconds) must be used - .seconds
+                    # drops the day component, so a weekly/monthly schedule
+                    # would otherwise never re-fire once >24h had elapsed.
                     if (last_action_time is None or 
-                        (current_time - last_action_time).seconds > 3600):
+                        (current_time - last_action_time).total_seconds() > 3600):
                         
                         self._execute_schedule(schedule)
                         self.last_action[schedule_id] = current_time

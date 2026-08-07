@@ -5,6 +5,7 @@ Utility functions for Webcam Spyware Security
 import socket
 import platform
 import os
+import sys
 import json
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any, List
@@ -12,6 +13,103 @@ import logging
 import subprocess
 
 logger = logging.getLogger(__name__)
+
+
+class AppPaths:
+    """Resolves where the application stores data.
+
+    When running from source, everything lives in the project folder as
+    before. When frozen with PyInstaller (onefile), the executable is
+    unpacked to a temporary directory (_MEIxxxx) that is deleted on exit, so
+    anything written there is lost - this class redirects all writable data
+    (database, encryption key, logs, faces, evidence, reports) to a persistent
+    per-user folder instead, while read-only bundled resources (models, icons)
+    are still read from the extraction directory via bundle_dir().
+    """
+
+    APP_DATA_DIR_NAME = "WebcamSpywareSecurity"
+
+    @staticmethod
+    def is_frozen() -> bool:
+        """True when running from a PyInstaller bundle."""
+        return bool(getattr(sys, 'frozen', False))
+
+    @classmethod
+    def bundle_dir(cls) -> str:
+        """Read-only location of bundled resources (sys._MEIPASS when frozen,
+        otherwise the project directory)."""
+        if cls.is_frozen():
+            return getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))
+        return os.path.dirname(os.path.abspath(__file__))
+
+    @classmethod
+    def data_dir(cls) -> str:
+        """Persistent, writable root for all user data."""
+        if cls.is_frozen():
+            base = os.environ.get('LOCALAPPDATA') or os.path.expanduser('~')
+            return os.path.join(base, cls.APP_DATA_DIR_NAME)
+        return os.path.dirname(os.path.abspath(__file__))
+
+    @classmethod
+    def database_dir(cls) -> str:
+        return os.path.join(cls.data_dir(), 'database')
+
+    @classmethod
+    def logs_dir(cls) -> str:
+        return os.path.join(cls.data_dir(), 'logs')
+
+    @classmethod
+    def reports_dir(cls) -> str:
+        return os.path.join(cls.data_dir(), 'reports')
+
+    @classmethod
+    def faces_dir(cls) -> str:
+        return os.path.join(cls.data_dir(), 'assets', 'faces')
+
+    @classmethod
+    def intruder_images_dir(cls) -> str:
+        return os.path.join(cls.data_dir(), 'intruder_images')
+
+    @classmethod
+    def temp_dir(cls) -> str:
+        return os.path.join(cls.data_dir(), 'temp')
+
+    @classmethod
+    def seed_bundled_database(cls):
+        """First-run bootstrap for frozen builds: copy the bundled app.db and
+        its matched .encryption_key into the persistent data folder together,
+        so the key never gets separated from the database it encrypts and the
+        shipped demo data survives the session. No-op when running from
+        source, where the project copy is already persistent."""
+        if not cls.is_frozen():
+            return
+        try:
+            import shutil
+            db_dir = cls.database_dir()
+            db_path = os.path.join(db_dir, 'app.db')
+            key_path = os.path.join(db_dir, '.encryption_key')
+            os.makedirs(db_dir, exist_ok=True)
+
+            if not os.path.exists(db_path):
+                bundled_db = os.path.join(cls.bundle_dir(), 'database', 'app.db')
+                if os.path.exists(bundled_db):
+                    shutil.copy2(bundled_db, db_path)
+                    logger.info(f"Seeded persistent database from bundle: {db_path}")
+                    # The key and DB must stay a matched pair: if we seed the
+                    # DB from the bundle, re-seed the key too (overwrite any
+                    # stale local key) so log decryption keeps working.
+                    bundled_key = os.path.join(cls.bundle_dir(), 'database', '.encryption_key')
+                    if os.path.exists(bundled_key):
+                        shutil.copy2(bundled_key, key_path)
+                        logger.info(f"Seeded matching encryption key from bundle: {key_path}")
+
+            if not os.path.exists(key_path):
+                bundled_key = os.path.join(cls.bundle_dir(), 'database', '.encryption_key')
+                if os.path.exists(bundled_key):
+                    shutil.copy2(bundled_key, key_path)
+                    logger.info(f"Seeded persistent encryption key from bundle: {key_path}")
+        except Exception as e:
+            logger.warning(f"Could not seed bundled database: {e}")
 
 
 class SystemInfo:

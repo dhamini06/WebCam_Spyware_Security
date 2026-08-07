@@ -48,7 +48,7 @@ import base64
 import pickle
 
 from database import DatabaseManager
-from utils import FileUtils, SystemInfo, DateTimeUtils
+from utils import FileUtils, SystemInfo, DateTimeUtils, AppPaths
 
 logger = logging.getLogger(__name__)
 
@@ -56,11 +56,14 @@ FACE_CASCADE_PATH = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml
 
 # The project already ships a top-level intruder_images/ folder for exactly
 # this purpose - save evidence there directly rather than nested under
-# assets/faces/, so it's where you'd actually go looking for it.
-_INTRUDER_IMAGES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'intruder_images')
+# assets/faces/, so it's where you'd actually go looking for it. In frozen
+# builds this is the persistent data folder, not the temp extraction dir.
+_INTRUDER_IMAGES_DIR = AppPaths.intruder_images_dir()
 
 # Two small files enable the high-accuracy DNN backend - see download_models.py.
-_MODELS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'models')
+# Models are read-only bundled resources, so in frozen builds they are read
+# straight from the extraction directory (they never need to be writable).
+_MODELS_DIR = os.path.join(AppPaths.bundle_dir(), 'models')
 _YUNET_MODEL = os.path.join(_MODELS_DIR, 'face_detection_yunet_2023mar.onnx')
 _SFACE_MODEL = os.path.join(_MODELS_DIR, 'face_recognition_sface_2021dec.onnx')
 
@@ -88,9 +91,7 @@ class FaceManager:
 
     def __init__(self, db: DatabaseManager = None, faces_dir: str = None):
         self.db = db or DatabaseManager()
-        self.faces_dir = faces_dir or os.path.join(
-            os.path.dirname(__file__), 'assets', 'faces'
-        )
+        self.faces_dir = faces_dir or AppPaths.faces_dir()
         self._ensure_faces_dir()
         self.face_encodings_cache = {}
 

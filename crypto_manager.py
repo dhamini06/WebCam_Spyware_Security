@@ -8,6 +8,7 @@ import json
 from typing import Optional, Dict, Any
 from cryptography.fernet import Fernet
 import logging
+from utils import AppPaths
 
 logger = logging.getLogger(__name__)
 
@@ -23,7 +24,7 @@ class CryptoManager:
             key_path: Path to encryption key file. If not exists, creates new key.
         """
         if key_path is None:
-            key_path = os.path.join(os.path.dirname(__file__), 'database', '.encryption_key')
+            key_path = os.path.join(AppPaths.database_dir(), '.encryption_key')
         
         self.key_path = key_path
         self._ensure_key_exists()

@@ -255,6 +255,27 @@ class PolicyManager:
                 if hasattr(policy, key):
                     setattr(policy, key, value)
             
+            # Persist to database so enable/disable changes survive a restart.
+            # In-memory names and DB column names differ, so map them.
+            db_fields = {
+                'description': 'description',
+                'policy_type': 'policy_type',
+                'scope': 'scope',
+                'enabled': 'is_active',
+                'start_time': 'allowed_start_time',
+                'end_time': 'allowed_end_time',
+            }
+            db_kwargs = {
+                db_field: kwargs[key]
+                for key, db_field in db_fields.items()
+                if key in kwargs
+            }
+            if db_kwargs:
+                try:
+                    self.db.update_policy(policy_id, **db_kwargs)
+                except Exception as e:
+                    logger.warning(f"Could not persist policy update to database: {e}")
+            
             logger.info(f"Policy updated: {policy_id}")
             return True
         
@@ -275,6 +296,12 @@ class PolicyManager:
         try:
             if policy_id not in self.policies:
                 return False
+            
+            # Soft-delete in the database so it stays deleted after a restart
+            try:
+                self.db.delete_policy(policy_id)
+            except Exception as e:
+                logger.warning(f"Could not persist policy deletion to database: {e}")
             
             del self.policies[policy_id]
             logger.info(f"Policy deleted: {policy_id}")

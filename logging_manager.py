@@ -12,7 +12,7 @@ import json
 
 from database import DatabaseManager
 from crypto_manager import CryptoManager
-from utils import SystemInfo, DateTimeUtils, FileUtils
+from utils import SystemInfo, DateTimeUtils, FileUtils, AppPaths
 
 logger = logging.getLogger(__name__)
 
@@ -40,9 +40,7 @@ class LoggingManager:
         """
         self.db = db or DatabaseManager()
         self.crypto = crypto or CryptoManager()
-        self.log_dir = log_dir or os.path.join(
-            os.path.dirname(__file__), 'logs'
-        )
+        self.log_dir = log_dir or AppPaths.logs_dir()
         FileUtils.ensure_dir_exists(self.log_dir)
         self._setup_python_logging()
     
@@ -312,6 +310,7 @@ class LoggingManager:
             for log in logs:
                 log['timestamp'] = str(log.get('timestamp', ''))
             
+            FileUtils.ensure_dir_exists(os.path.dirname(output_path) or os.getcwd())
             with open(output_path, 'w') as f:
                 json.dump(logs, f, indent=2)
             
@@ -352,6 +351,7 @@ class LoggingManager:
             # Get field names
             fieldnames = list(logs[0].keys()) if logs else []
             
+            FileUtils.ensure_dir_exists(os.path.dirname(output_path) or os.getcwd())
             with open(output_path, 'w', newline='') as f:
                 writer = csv.DictWriter(f, fieldnames=fieldnames)
                 writer.writeheader()
